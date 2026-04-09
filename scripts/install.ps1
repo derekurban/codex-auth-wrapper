@@ -73,7 +73,12 @@ function Normalize-PathEntry {
   if (-not $PathEntry) {
     return $null
   }
-  return [System.IO.Path]::TrimEndingDirectorySeparator($PathEntry).ToLowerInvariant()
+  $Normalized = $PathEntry.Trim()
+  if (-not $Normalized) {
+    return $null
+  }
+  $Normalized = $Normalized -replace '[\\/]+$',''
+  return $Normalized.ToLowerInvariant()
 }
 
 function Path-ContainsEntry {
