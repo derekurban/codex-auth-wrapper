@@ -1,7 +1,7 @@
 param(
   [string]$Version = $env:VERSION,
-  [string]$InstallDir = $(if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $env:USERPROFILE "bin" }),
-  [string]$CacheDir = $(if ($env:CAW_CACHE_DIR) { $env:CAW_CACHE_DIR } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "codex-auth-wrapper\\cache" } else { Join-Path ([System.IO.Path]::GetTempPath()) "codex-auth-wrapper-cache" }),
+  [string]$InstallDir = $env:INSTALL_DIR,
+  [string]$CacheDir = $env:CAW_CACHE_DIR,
   [switch]$NoCheck
 )
 
@@ -9,6 +9,19 @@ $ErrorActionPreference = "Stop"
 
 $Repo = "derekurban/codex-auth-wrapper"
 $Binary = "caw"
+
+if (-not $InstallDir) {
+  $InstallDir = Join-Path $env:USERPROFILE "bin"
+}
+
+if (-not $CacheDir) {
+  if ($env:LOCALAPPDATA) {
+    $CacheDir = Join-Path (Join-Path $env:LOCALAPPDATA "codex-auth-wrapper") "cache"
+  }
+  else {
+    $CacheDir = Join-Path ([System.IO.Path]::GetTempPath()) "codex-auth-wrapper-cache"
+  }
+}
 
 function Resolve-Version {
   param([string]$RequestedVersion)
