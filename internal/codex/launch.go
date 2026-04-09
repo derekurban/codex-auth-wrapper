@@ -43,6 +43,14 @@ func RunLogin(tempCodexHome string) error {
 }
 
 func LaunchRemote(spec ipc.LaunchSpec, codexHome string) error {
+	cmd, err := StartRemote(spec, codexHome)
+	if err != nil {
+		return err
+	}
+	return cmd.Wait()
+}
+
+func StartRemote(spec ipc.LaunchSpec, codexHome string) (*exec.Cmd, error) {
 	args := []string{}
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		args = append(args, "resume", *spec.ThreadID)
@@ -65,5 +73,8 @@ func LaunchRemote(spec ipc.LaunchSpec, codexHome string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
 }

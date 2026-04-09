@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -73,7 +74,7 @@ func runBroker(paths store.Paths) error {
 }
 
 func runStatus(paths store.Paths) error {
-	client, err := ensureClient(paths)
+	client, err := ensureClient(paths, nil)
 	if err != nil {
 		return err
 	}
@@ -100,7 +101,7 @@ func runStatus(paths store.Paths) error {
 }
 
 func stopBroker(paths store.Paths) error {
-	client, err := ensureClient(paths)
+	client, err := ensureClient(paths, nil)
 	if err != nil {
 		return err
 	}
@@ -117,7 +118,20 @@ func unregisterSession(client *ipc.Client, sessionID string) {
 }
 
 func runHost(paths store.Paths) error {
-	client, err := ensureClient(paths)
+	events := make(chan homeui.ExternalEvent, 32)
+	client, err := ensureClient(paths, func(name string, payload json.RawMessage) {
+		if name != "reload.notice" {
+			return
+		}
+		var notice ipc.ReloadNotice
+		if err := json.Unmarshal(payload, &notice); err != nil {
+			return
+		}
+		select {
+		case events <- homeui.ExternalEvent{Reload: &notice}:
+		default:
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -140,7 +154,7 @@ func runHost(paths store.Paths) error {
 
 	statusMessage := ""
 	for {
-		action, err := homeui.Run(client, sessionID, statusMessage)
+		action, err := homeui.Run(client, events, sessionID, statusMessage)
 		if err != nil {
 			return err
 		}
@@ -155,7 +169,7 @@ func runHost(paths store.Paths) error {
 				statusMessage = message
 			}
 		case homeui.ActionContinue:
-			message, err := launchCodexFlow(client, paths, sessionID, cwd)
+			message, err := launchCodexFlow(client, paths, events, sessionID, cwd)
 			if err != nil {
 				statusMessage = "Codex launch failed: " + err.Error()
 			} else {
@@ -196,48 +210,85 @@ func addProfileFlow(client *ipc.Client, action homeui.Action) (string, error) {
 	return fmt.Sprintf("Linked account %q.", action.ProfileName), nil
 }
 
-func launchCodexFlow(client *ipc.Client, paths store.Paths, sessionID string, cwd string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var spec ipc.LaunchSpec
-	if err := client.Request(ctx, "launch.prepare", ipc.PrepareLaunchRequest{
-		SessionID: sessionID,
-		Cwd:       cwd,
-	}, &spec); err != nil {
-		return "", err
-	}
-	if err := client.Request(ctx, "session.update_state", ipc.UpdateSessionStateRequest{
-		SessionID: sessionID,
-		State:     model.SessionStateInCodex,
-	}, nil); err != nil {
-		return "", err
-	}
-	if spec.Settings.ClearTerminalBeforeLaunch {
-		clearTerminal()
-	}
-	fmt.Println()
-	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
-		fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
-	} else {
-		fmt.Println("Launching stock Codex connected to the shared wrapper-managed app-server.")
-	}
-	fmt.Println("Exit Codex normally to return to the wrapper home. F12 interception is not wired yet in this build.")
-	fmt.Println()
-	err := codex.LaunchRemote(spec, paths.CodexHome)
-	homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer homeCancel()
-	_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return returnHomeMessage(spec), nil
+func launchCodexFlow(client *ipc.Client, paths store.Paths, events <-chan homeui.ExternalEvent, sessionID string, cwd string) (string, error) {
+	autoReloaded := false
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var spec ipc.LaunchSpec
+		err := client.Request(ctx, "launch.prepare", ipc.PrepareLaunchRequest{
+			SessionID: sessionID,
+			Cwd:       cwd,
+		}, &spec)
+		cancel()
+		if err != nil {
+			return "", err
 		}
-		return "", err
+		if err := client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
+			SessionID: sessionID,
+			State:     model.SessionStateInCodex,
+		}, nil); err != nil {
+			return "", err
+		}
+		if spec.Settings.ClearTerminalBeforeLaunch {
+			clearTerminal()
+		}
+		fmt.Println()
+		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
+			fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
+		} else {
+			fmt.Println("Launching stock Codex connected to the shared wrapper-managed app-server.")
+		}
+		fmt.Println("Exit Codex normally to return to the wrapper home. F12 interception is not wired yet in this build.")
+		fmt.Println()
+
+		cmd, err := codex.StartRemote(spec, paths.CodexHome)
+		if err != nil {
+			return "", err
+		}
+		waitCh := make(chan error, 1)
+		go func() {
+			waitCh <- cmd.Wait()
+		}()
+
+		reloading := false
+		for {
+			select {
+			case err := <-waitCh:
+				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
+				homeCancel()
+				if reloading {
+					autoReloaded = true
+					break
+				}
+				if err != nil {
+					var exitErr *exec.ExitError
+					if errors.As(err, &exitErr) {
+						return returnHomeMessage(spec, autoReloaded), nil
+					}
+					return "", err
+				}
+				return returnHomeMessage(spec, autoReloaded), nil
+			case event := <-events:
+				if event.Reload == nil || event.Reload.AuthEpochID == spec.AuthEpochID {
+					continue
+				}
+				reloading = true
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+			}
+		}
 	}
-	return returnHomeMessage(spec), nil
 }
 
-func returnHomeMessage(spec ipc.LaunchSpec) string {
+func returnHomeMessage(spec ipc.LaunchSpec, autoReloaded bool) string {
+	if autoReloaded {
+		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
+			return fmt.Sprintf("Account switched in another CAW window. Codex reloaded and resumed thread %s.", *spec.ThreadID)
+		}
+		return "Account switched in another CAW window. Codex reloaded on the active profile."
+	}
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		return fmt.Sprintf("Returned from Codex. Enter resumes thread %s.", *spec.ThreadID)
 	}
@@ -248,13 +299,13 @@ func clearTerminal() {
 	fmt.Print("\x1b[2J\x1b[H")
 }
 
-func ensureClient(paths store.Paths) (*ipc.Client, error) {
+func ensureClient(paths store.Paths, handler ipc.EventHandler) (*ipc.Client, error) {
 	if err := ensureBroker(paths); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return ipc.Dial(ctx, 5*time.Second, nil)
+	return ipc.Dial(ctx, 5*time.Second, handler)
 }
 
 func ensureBroker(paths store.Paths) error {

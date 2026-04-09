@@ -36,6 +36,10 @@ type Action struct {
 	ProfileID   string
 }
 
+type ExternalEvent struct {
+	Reload *ipc.ReloadNotice
+}
+
 type screen string
 
 const (
@@ -46,6 +50,7 @@ const (
 
 type Model struct {
 	client        *ipc.Client
+	events        <-chan ExternalEvent
 	sessionID     string
 	screen        screen
 	width         int
@@ -75,8 +80,9 @@ type settingsUpdatedMsg struct {
 }
 
 type refreshTickMsg time.Time
+type externalEventMsg ExternalEvent
 
-func Run(client *ipc.Client, sessionID string, statusMessage string) (Action, error) {
+func Run(client *ipc.Client, events <-chan ExternalEvent, sessionID string, statusMessage string) (Action, error) {
 	nameInput := textinput.New()
 	nameInput.Placeholder = "Personal 1"
 	nameInput.CharLimit = 48
@@ -88,6 +94,7 @@ func Run(client *ipc.Client, sessionID string, statusMessage string) (Action, er
 
 	model := Model{
 		client:        client,
+		events:        events,
 		sessionID:     sessionID,
 		screen:        screenHome,
 		isLoading:     true,
@@ -105,7 +112,7 @@ func Run(client *ipc.Client, sessionID string, statusMessage string) (Action, er
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshCmd(false), m.refreshTickCmd())
+	return tea.Batch(m.refreshCmd(false), m.refreshTickCmd(), m.waitForExternalEvent())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -131,6 +138,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshot = msg.snapshot
 		m.syncSelection()
 		return m, nil
+	case externalEventMsg:
+		cmds := []tea.Cmd{m.waitForExternalEvent()}
+		if msg.Reload != nil {
+			m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile."
+			cmds = append(cmds, m.refreshCmd(false))
+		}
+		return m, tea.Batch(cmds...)
 	case settingsUpdatedMsg:
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
@@ -811,6 +825,19 @@ func loadSnapshot(client *ipc.Client, sessionID string, force bool) snapshotMsg 
 		ForceRefresh: force,
 	}, &snapshot)
 	return snapshotMsg{snapshot: snapshot, err: err}
+}
+
+func (m Model) waitForExternalEvent() tea.Cmd {
+	if m.events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, ok := <-m.events
+		if !ok {
+			return nil
+		}
+		return externalEventMsg(event)
+	}
 }
 
 func max(a, b int) int {
