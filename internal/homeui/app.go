@@ -141,7 +141,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case externalEventMsg:
 		cmds := []tea.Cmd{m.waitForExternalEvent()}
 		if msg.Reload != nil {
-			m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile."
+			m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile. Any active Codex session will pick up the new account after it returns here."
 			cmds = append(cmds, m.refreshCmd(false))
 		}
 		return m, tea.Batch(cmds...)

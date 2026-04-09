@@ -211,7 +211,7 @@ func addProfileFlow(client *ipc.Client, action homeui.Action) (string, error) {
 }
 
 func launchCodexFlow(client *ipc.Client, paths store.Paths, events <-chan homeui.ExternalEvent, sessionID string, cwd string) (string, error) {
-	autoReloaded := false
+	pendingReload := false
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var spec ipc.LaunchSpec
@@ -250,49 +250,45 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, events <-chan homeui
 			waitCh <- cmd.Wait()
 		}()
 
-		reloading := false
 		for {
 			select {
 			case err := <-waitCh:
 				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
 				homeCancel()
-				if reloading {
-					autoReloaded = true
-					break
-				}
 				if err != nil {
 					var exitErr *exec.ExitError
 					if errors.As(err, &exitErr) {
-						return returnHomeMessage(spec, autoReloaded), nil
+						return returnHomeMessage(spec, pendingReload), nil
 					}
 					return "", err
 				}
-				return returnHomeMessage(spec, autoReloaded), nil
+				return returnHomeMessage(spec, pendingReload), nil
 			case event := <-events:
-				if event.Reload == nil || event.Reload.AuthEpochID == spec.AuthEpochID {
+				if event.Reload == nil || !isNewerAuthEpoch(event.Reload.AuthEpochID, spec.AuthEpochID) {
 					continue
 				}
-				reloading = true
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
+				pendingReload = true
 			}
 		}
 	}
 }
 
-func returnHomeMessage(spec ipc.LaunchSpec, autoReloaded bool) string {
-	if autoReloaded {
+func returnHomeMessage(spec ipc.LaunchSpec, pendingReload bool) string {
+	if pendingReload {
 		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
-			return fmt.Sprintf("Account switched in another CAW window. Codex reloaded and resumed thread %s.", *spec.ThreadID)
+			return fmt.Sprintf("Account switched in another CAW window while you were working. This Home session is now on the active profile. Enter will resume thread %s on the new account.", *spec.ThreadID)
 		}
-		return "Account switched in another CAW window. Codex reloaded on the active profile."
+		return "Account switched in another CAW window while you were working. This Home session is now on the active profile."
 	}
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		return fmt.Sprintf("Returned from Codex. Enter resumes thread %s.", *spec.ThreadID)
 	}
 	return "Returned from Codex."
+}
+
+func isNewerAuthEpoch(candidate string, current string) bool {
+	return candidate > current
 }
 
 func clearTerminal() {
