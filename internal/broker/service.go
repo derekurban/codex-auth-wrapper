@@ -28,6 +28,7 @@ const (
 	profileRefreshInterval = 2 * time.Minute
 	warningRefreshInterval = 30 * time.Second
 	errorRefreshInterval   = 45 * time.Second
+	idleShutdownDelay      = 10 * time.Second
 )
 
 type Service struct {
@@ -133,6 +134,12 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 			return nil, err
 		}
 		return ipc.Empty{}, s.returnHome(req.SessionID)
+	case "session.unregister":
+		var req ipc.UnregisterSessionRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return ipc.Empty{}, s.unregisterSession(req.SessionID)
 	case "session.update_state":
 		var req ipc.UpdateSessionStateRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -391,7 +398,29 @@ func (s *Service) returnHome(sessionID string) error {
 	record.UpdatedAt = now
 	sessions.Sessions[sessionID] = record
 	sessions.UpdatedAt = now
-	return s.store.SaveSessions(sessions)
+	if err := s.store.SaveSessions(sessions); err != nil {
+		return err
+	}
+	s.maybeScheduleIdleShutdown()
+	return nil
+}
+
+func (s *Service) unregisterSession(sessionID string) error {
+	sessions, err := s.store.LoadSessions()
+	if err != nil {
+		return err
+	}
+	if _, ok := sessions.Sessions[sessionID]; !ok {
+		s.maybeScheduleIdleShutdown()
+		return nil
+	}
+	delete(sessions.Sessions, sessionID)
+	sessions.UpdatedAt = time.Now()
+	if err := s.store.SaveSessions(sessions); err != nil {
+		return err
+	}
+	s.maybeScheduleIdleShutdown()
+	return nil
 }
 
 func (s *Service) updateSessionState(req ipc.UpdateSessionStateRequest) error {
@@ -412,7 +441,11 @@ func (s *Service) updateSessionState(req ipc.UpdateSessionStateRequest) error {
 	record.UpdatedAt = now
 	sessions.Sessions[req.SessionID] = record
 	sessions.UpdatedAt = now
-	return s.store.SaveSessions(sessions)
+	if err := s.store.SaveSessions(sessions); err != nil {
+		return err
+	}
+	s.maybeScheduleIdleShutdown()
+	return nil
 }
 
 func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
@@ -733,6 +766,26 @@ func (s *Service) clearDegraded() {
 	s.mu.Lock()
 	s.degradedReason = ""
 	s.mu.Unlock()
+}
+
+func (s *Service) maybeScheduleIdleShutdown() {
+	go func() {
+		time.Sleep(idleShutdownDelay)
+		sessions, err := s.store.LoadSessions()
+		if err != nil {
+			return
+		}
+		if len(sessions.Sessions) > 0 {
+			return
+		}
+		s.shutdownAppServer()
+		s.mu.Lock()
+		server := s.server
+		s.mu.Unlock()
+		if server != nil {
+			_ = server.Close()
+		}
+	}()
 }
 
 func nextEpochID(counter int) string {

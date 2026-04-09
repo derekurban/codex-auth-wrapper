@@ -41,6 +41,8 @@ func run(args []string) error {
 	case len(args) >= 1 && (args[0] == "--version" || args[0] == "-V" || args[0] == "version"):
 		printVersion()
 		return nil
+	case len(args) >= 1 && args[0] == "shutdown":
+		return stopBroker(paths)
 	case len(args) >= 2 && args[0] == "internal" && args[1] == "broker":
 		return runBroker(paths)
 	case len(args) >= 1 && args[0] == "status":
@@ -108,6 +110,12 @@ func stopBroker(paths store.Paths) error {
 	return client.Request(ctx, "broker.stop", ipc.Empty{}, nil)
 }
 
+func unregisterSession(client *ipc.Client, sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = client.Request(ctx, "session.unregister", ipc.UnregisterSessionRequest{SessionID: sessionID}, nil)
+}
+
 func runHost(paths store.Paths) error {
 	client, err := ensureClient(paths)
 	if err != nil {
@@ -128,6 +136,7 @@ func runHost(paths store.Paths) error {
 	}, nil); err != nil {
 		return err
 	}
+	defer unregisterSession(client, sessionID)
 
 	statusMessage := ""
 	for {

@@ -109,6 +109,10 @@ type ReturnHomeRequest struct {
 	SessionID string `json:"session_id"`
 }
 
+type UnregisterSessionRequest struct {
+	SessionID string `json:"session_id"`
+}
+
 type UpdateSessionStateRequest struct {
 	SessionID     string             `json:"session_id"`
 	State         model.SessionState `json:"state"`

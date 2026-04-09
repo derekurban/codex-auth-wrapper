@@ -117,6 +117,46 @@ function Ensure-PathContains {
   }
 }
 
+function Get-CawProcesses {
+  Get-Process -Name $Binary -ErrorAction SilentlyContinue
+}
+
+function Stop-RunningCAW {
+  param([string]$BinaryPath)
+
+  if (-not (Test-Path $BinaryPath)) {
+    return
+  }
+
+  $HadProcesses = @(Get-CawProcesses).Count -gt 0
+  if (-not $HadProcesses) {
+    return
+  }
+
+  Write-Host "Stopping running caw processes..."
+
+  try {
+    & $BinaryPath shutdown | Out-Null
+  }
+  catch {
+    try {
+      & $BinaryPath broker stop | Out-Null
+    }
+    catch {
+    }
+  }
+
+  for ($i = 0; $i -lt 40; $i++) {
+    $Processes = @(Get-CawProcesses)
+    if ($Processes.Count -eq 0) {
+      return
+    }
+    Start-Sleep -Milliseconds 250
+  }
+
+  throw "caw.exe is still running. Close all caw windows and retry the installer."
+}
+
 $ResolvedVersion = Resolve-Version -RequestedVersion $Version
 $AssetVersion = $ResolvedVersion -replace '^v', ''
 $Arch = Resolve-Arch
@@ -166,6 +206,7 @@ try {
 
   $Destination = Join-Path $InstallDir "$Binary.exe"
   $ShimPath = Join-Path $InstallDir "$Binary.cmd"
+  Stop-RunningCAW -BinaryPath $Destination
   Copy-Item -Path $BinaryPath.FullName -Destination $Destination -Force
   Set-Content -Path $ShimPath -Value "@echo off`r`n""%~dp0$Binary.exe"" %*`r`n" -NoNewline
   Ensure-PathContains -Directory $InstallDir
