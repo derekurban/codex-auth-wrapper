@@ -192,7 +192,7 @@ func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
 		return data
 	}
 	method, _ := msg["method"].(string)
-	if method != "thread/list" {
+	if method != "thread/list" && method != "thread/start" {
 		return data
 	}
 
@@ -200,10 +200,6 @@ func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
 	if params == nil {
 		params = map[string]any{}
 	}
-	if rawCwd, exists := params["cwd"]; exists && rawCwd != nil && fmt.Sprint(rawCwd) != "" {
-		return data
-	}
-
 	params["cwd"] = cwd
 	msg["params"] = params
 	rewritten, err := json.Marshal(msg)

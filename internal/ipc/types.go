@@ -49,6 +49,7 @@ type HomeSnapshotResponse struct {
 	Settings          WrapperSettings      `json:"settings"`
 	BrokerState       model.BrokerState    `json:"broker_state"`
 	ActiveAuthEpochID string               `json:"active_auth_epoch_id"`
+	RefreshInProgress bool                 `json:"refresh_in_progress"`
 	DegradedReason    *string              `json:"degraded_reason"`
 }
 

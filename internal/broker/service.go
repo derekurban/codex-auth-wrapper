@@ -29,6 +29,8 @@ const (
 	warningRefreshInterval = 30 * time.Second
 	errorRefreshInterval   = 45 * time.Second
 	idleShutdownDelay      = 10 * time.Second
+	backgroundRefreshTTL   = 20 * time.Second
+	maxProfileRefreshJobs  = 3
 )
 
 type Service struct {
@@ -36,6 +38,7 @@ type Service struct {
 	store *store.Store
 
 	mu             sync.Mutex
+	refreshRunMu   sync.Mutex
 	server         *ipc.Server
 	gateway        *gatewayServer
 	appServerCmd   *exec.Cmd
@@ -45,6 +48,7 @@ type Service struct {
 	sessionTokens  map[string]string
 	control        *codex.AppServerClient
 	degradedReason string
+	refreshing     bool
 }
 
 func New(paths store.Paths) *Service {
@@ -165,7 +169,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return ipc.Empty{}, s.refreshProfileStatuses(ctx, req.ForceRefresh)
+		return ipc.Empty{}, s.runProfileRefresh(ctx, req.ForceRefresh, false)
 	case "broker.stop":
 		go func() {
 			time.Sleep(50 * time.Millisecond)
@@ -210,8 +214,12 @@ func (s *Service) registerSession(req ipc.RegisterSessionRequest) error {
 }
 
 func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest) (ipc.HomeSnapshotResponse, error) {
-	if err := s.refreshProfileStatuses(ctx, req.ForceRefresh); err != nil {
-		s.setDegraded(err)
+	if req.ForceRefresh {
+		if err := s.runProfileRefresh(ctx, true, false); err != nil {
+			s.setDegraded(err)
+		}
+	} else if s.shouldStartBackgroundRefresh() {
+		s.startBackgroundRefresh()
 	}
 	state, err := s.store.LoadState()
 	if err != nil {
@@ -259,6 +267,7 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 		},
 		BrokerState:       brokerState.BrokerState,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
+		RefreshInProgress: s.refreshInProgress(),
 	}
 	if session, ok := sessions.Sessions[req.SessionID]; ok {
 		resp.Session = &session
@@ -317,6 +326,7 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 	refreshCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	if err := s.refreshProfileStatus(refreshCtx, req.ID); err != nil {
+		s.setDegraded(err)
 		return err
 	}
 	return nil
@@ -510,6 +520,9 @@ func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
 }
 
 func (s *Service) activateProfile(ctx context.Context, profileID string, reason string) error {
+	if s.canReuseActiveProfile(profileID) {
+		return s.markActiveProfile(profileID, "")
+	}
 	if err := s.store.CopyProfileAuthToRuntime(profileID); err != nil {
 		return err
 	}
@@ -517,6 +530,10 @@ func (s *Service) activateProfile(ctx context.Context, profileID string, reason 
 	if err := s.startAppServer(ctx, profileID, reason); err != nil {
 		return err
 	}
+	return s.markActiveProfile(profileID, reason)
+}
+
+func (s *Service) markActiveProfile(profileID string, reason string) error {
 	state, err := s.store.LoadState()
 	if err != nil {
 		return err
@@ -530,11 +547,15 @@ func (s *Service) activateProfile(ctx context.Context, profileID string, reason 
 	brokerState.ActiveProfileID = &profileID
 	brokerState.ActiveAuthEpochID = state.CurrentAuthEpochID
 	brokerState.Server.State = model.ServerStateHealthy
-	brokerState.Server.ListenURL = &s.appServerURL
+	if s.appServerURL != "" {
+		brokerState.Server.ListenURL = &s.appServerURL
+	}
 	authMode := "capability-token"
 	brokerState.Server.AuthMode = &authMode
-	brokerState.Server.StartedAt = &now
-	brokerState.Server.LastRestartReason = &reason
+	if reason != "" {
+		brokerState.Server.StartedAt = &now
+		brokerState.Server.LastRestartReason = &reason
+	}
 	brokerState.SwitchContext = model.SwitchContext{}
 	brokerState.UpdatedAt = now
 	if err := s.store.SaveBroker(brokerState); err != nil {
@@ -548,6 +569,19 @@ func (s *Service) activateProfile(ctx context.Context, profileID string, reason 
 	}
 	s.clearDegraded()
 	return nil
+}
+
+func (s *Service) canReuseActiveProfile(profileID string) bool {
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return false
+	}
+	if brokerState.ActiveProfileID == nil || *brokerState.ActiveProfileID != profileID || brokerState.Server.State != model.ServerStateHealthy {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appServerCmd != nil && s.control != nil && s.appServerURL != ""
 }
 
 func (s *Service) startAppServer(ctx context.Context, profileID, reason string) error {
@@ -648,15 +682,98 @@ func (s *Service) refreshProfileStatuses(ctx context.Context, force bool) error 
 	if err != nil {
 		return err
 	}
+	targets := make([]string, 0, len(profiles))
 	for _, profile := range profiles {
 		if !force && !shouldRefreshProfile(profile) {
 			continue
 		}
-		if err := s.refreshProfileStatus(ctx, profile.ID); err != nil {
+		targets = append(targets, profile.ID)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(targets))
+	sem := make(chan struct{}, maxProfileRefreshJobs)
+	for _, profileID := range targets {
+		profileID := profileID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			if err := s.refreshProfileStatus(ctx, profileID); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Service) shouldStartBackgroundRefresh() bool {
+	if s.refreshInProgress() {
+		return false
+	}
+	profiles, err := s.store.ListProfiles()
+	if err != nil {
+		return false
+	}
+	for _, profile := range profiles {
+		if shouldRefreshProfile(profile) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) startBackgroundRefresh() {
+	s.mu.Lock()
+	if s.refreshing {
+		s.mu.Unlock()
+		return
+	}
+	s.refreshing = true
+	s.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTTL)
+		defer cancel()
+		if err := s.runProfileRefresh(ctx, false, true); err != nil {
+			s.setDegraded(err)
+		}
+	}()
+}
+
+func (s *Service) runProfileRefresh(ctx context.Context, force bool, alreadyMarked bool) error {
+	s.refreshRunMu.Lock()
+	defer s.refreshRunMu.Unlock()
+	if !alreadyMarked {
+		s.setRefreshInProgress(true)
+	}
+	defer s.setRefreshInProgress(false)
+	return s.refreshProfileStatuses(ctx, force)
+}
+
+func (s *Service) setRefreshInProgress(v bool) {
+	s.mu.Lock()
+	s.refreshing = v
+	s.mu.Unlock()
+}
+
+func (s *Service) refreshInProgress() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshing
 }
 
 func (s *Service) refreshProfileStatus(ctx context.Context, profileID string) error {

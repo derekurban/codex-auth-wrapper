@@ -17,6 +17,7 @@ import (
 const (
 	defaultRefreshInterval = 45 * time.Second
 	warningRefreshInterval = 15 * time.Second
+	backgroundRefreshTick  = 2 * time.Second
 	pageHorizontalPadding  = 3
 	pageVerticalPadding    = 1
 )
@@ -66,6 +67,11 @@ type Model struct {
 type snapshotMsg struct {
 	snapshot ipc.HomeSnapshotResponse
 	err      error
+}
+
+type settingsUpdatedMsg struct {
+	value bool
+	err   error
 }
 
 type refreshTickMsg time.Time
@@ -124,6 +130,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.hasSnapshot = true
 		m.snapshot = msg.snapshot
 		m.syncSelection()
+		return m, nil
+	case settingsUpdatedMsg:
+		if msg.err != nil {
+			m.errMessage = msg.err.Error()
+			return m, nil
+		}
+		m.errMessage = ""
+		m.statusMessage = "Settings updated."
+		m.snapshot.Settings.ClearTerminalBeforeLaunch = msg.value
 		return m, nil
 	case tea.KeyMsg:
 		switch m.screen {
@@ -284,16 +299,15 @@ func (m Model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.refreshCmd(false)
 	case "enter", " ":
 		nextValue := !m.snapshot.Settings.ClearTerminalBeforeLaunch
-		m.isLoading = true
 		return m, func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			if err := m.client.Request(ctx, "settings.update", ipc.UpdateSettingsRequest{
 				ClearTerminalBeforeLaunch: nextValue,
 			}, nil); err != nil {
-				return snapshotMsg{err: err}
+				return settingsUpdatedMsg{err: err}
 			}
-			return loadSnapshot(m.client, m.sessionID, true)
+			return settingsUpdatedMsg{value: nextValue}
 		}
 	}
 	return m, nil
@@ -392,6 +406,9 @@ func (m Model) renderStatusLine() string {
 	}
 	if m.isLoading && !m.hasSnapshot {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Loading account data...")
+	}
+	if m.snapshot.RefreshInProgress {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Showing cached account data while background refresh runs.")
 	}
 	clearMode := "on"
 	if !m.snapshot.Settings.ClearTerminalBeforeLaunch {
@@ -764,6 +781,11 @@ func (m Model) refreshCmd(force bool) tea.Cmd {
 }
 
 func (m Model) refreshTickCmd() tea.Cmd {
+	if m.snapshot.RefreshInProgress {
+		return tea.Tick(backgroundRefreshTick, func(t time.Time) tea.Msg {
+			return refreshTickMsg(t)
+		})
+	}
 	interval := defaultRefreshInterval
 	for _, profile := range m.snapshot.Profiles {
 		if profile.WarningState != "" && profile.WarningState != "none" {
@@ -777,7 +799,11 @@ func (m Model) refreshTickCmd() tea.Cmd {
 }
 
 func loadSnapshot(client *ipc.Client, sessionID string, force bool) snapshotMsg {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	timeout := 5 * time.Second
+	if force {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var snapshot ipc.HomeSnapshotResponse
 	err := client.Request(ctx, "home.snapshot", ipc.HomeSnapshotRequest{
