@@ -23,7 +23,12 @@ import (
 	"github.com/derekurban/codex-auth-wrapper/internal/store"
 )
 
-const warningThreshold = 90
+const (
+	warningThreshold       = 90
+	profileRefreshInterval = 2 * time.Minute
+	warningRefreshInterval = 30 * time.Second
+	errorRefreshInterval   = 45 * time.Second
+)
 
 type Service struct {
 	paths store.Paths
@@ -103,7 +108,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return s.homeSnapshot(ctx, req.SessionID)
+		return s.homeSnapshot(ctx, req)
 	case "profile.add":
 		var req ipc.AddProfileRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -136,6 +141,12 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		return ipc.Empty{}, s.updateSessionState(req)
 	case "status.snapshot":
 		return s.statusSnapshot()
+	case "profiles.refresh":
+		var req ipc.HomeSnapshotRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return ipc.Empty{}, s.refreshProfileStatuses(ctx, req.ForceRefresh)
 	case "broker.stop":
 		go func() {
 			time.Sleep(50 * time.Millisecond)
@@ -178,8 +189,8 @@ func (s *Service) registerSession(req ipc.RegisterSessionRequest) error {
 	return s.store.SaveSessions(sessions)
 }
 
-func (s *Service) homeSnapshot(ctx context.Context, sessionID string) (ipc.HomeSnapshotResponse, error) {
-	if err := s.refreshSelectedProfileStatus(ctx); err != nil {
+func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest) (ipc.HomeSnapshotResponse, error) {
+	if err := s.refreshProfileStatuses(ctx, req.ForceRefresh); err != nil {
 		s.setDegraded(err)
 	}
 	state, err := s.store.LoadState()
@@ -207,8 +218,16 @@ func (s *Service) homeSnapshot(ctx context.Context, sessionID string) (ipc.HomeS
 			Enabled:              profile.Enabled,
 			Health:               profile.Status.Health,
 			WarningState:         profile.Status.WarningState,
+			Email:                profile.Status.Email,
+			PlanType:             profile.Status.PlanType,
+			LinkedAccountID:      profile.Status.LinkedAccountID,
+			LinkedUserID:         profile.Status.LinkedUserID,
 			FiveHourUsagePercent: profile.Status.FiveHourUsagePercent,
 			WeeklyUsagePercent:   profile.Status.WeeklyUsagePercent,
+			FiveHourResetsAt:     profile.Status.FiveHourResetsAt,
+			WeeklyResetsAt:       profile.Status.WeeklyResetsAt,
+			LastCheckedAt:        profile.Status.LastCheckedAt,
+			LastError:            profile.Status.LastError,
 			Selected:             selected,
 		})
 	}
@@ -218,7 +237,7 @@ func (s *Service) homeSnapshot(ctx context.Context, sessionID string) (ipc.HomeS
 		BrokerState:       brokerState.BrokerState,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
 	}
-	if session, ok := sessions.Sessions[sessionID]; ok {
+	if session, ok := sessions.Sessions[req.SessionID]; ok {
 		resp.Session = &session
 	}
 	if s.degradedReason != "" {
@@ -268,7 +287,14 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 		return err
 	}
 	if state.SelectedProfileID != nil && *state.SelectedProfileID == req.ID {
-		return s.activateProfile(context.Background(), req.ID, "first_profile_added")
+		if err := s.activateProfile(context.Background(), req.ID, "first_profile_added"); err != nil {
+			return err
+		}
+	}
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	if err := s.refreshProfileStatus(refreshCtx, req.ID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -546,56 +572,80 @@ func (s *Service) shutdownAppServer() {
 	}
 }
 
-func (s *Service) refreshSelectedProfileStatus(ctx context.Context) error {
-	state, err := s.store.LoadState()
+func (s *Service) refreshProfileStatuses(ctx context.Context, force bool) error {
+	profiles, err := s.store.ListProfiles()
 	if err != nil {
 		return err
 	}
-	if state.SelectedProfileID == nil {
-		return nil
+	for _, profile := range profiles {
+		if !force && !shouldRefreshProfile(profile) {
+			continue
+		}
+		if err := s.refreshProfileStatus(ctx, profile.ID); err != nil {
+			return err
+		}
 	}
-	s.mu.Lock()
-	control := s.control
-	s.mu.Unlock()
-	if control == nil {
-		return nil
-	}
-	profile, err := s.store.LoadProfile(*state.SelectedProfileID)
-	if err != nil {
-		return err
-	}
-	account, err := control.AccountRead(ctx)
-	if err != nil {
-		return err
-	}
-	rateLimits, err := control.RateLimitsRead(ctx)
+	return nil
+}
+
+func (s *Service) refreshProfileStatus(ctx context.Context, profileID string) error {
+	profile, err := s.store.LoadProfile(profileID)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	profile.UpdatedAt = now
-	profile.Status.LastCheckedAt = &now
+	if !profile.Enabled {
+		profile.Status.Health = model.ProfileHealthDisabled
+		profile.UpdatedAt = now
+		return s.store.SaveProfile(profile)
+	}
+
+	snapshot, err := codex.RefreshProfileUsage(ctx, profile.AuthFile)
+	if err != nil {
+		profile.Status.LastCheckedAt = &now
+		profile.Status.LastError = err.Error()
+		profile.Status.Health = healthState(profile.Enabled, profile.Status.Email, profile.Status.PlanType, profile.Status.WarningState, profile.Status.FiveHourUsagePercent, profile.Status.WeeklyUsagePercent, profile.Status.LastError)
+		profile.UpdatedAt = now
+		return s.store.SaveProfile(profile)
+	}
+
+	profile.Status.Email = snapshot.Identity.Email
+	profile.Status.PlanType = snapshot.Identity.PlanType
+	profile.Status.LinkedAccountID = snapshot.Identity.LinkedAccountID
+	profile.Status.LinkedUserID = snapshot.Identity.LinkedUserID
 	profile.Status.FiveHourUsagePercent = nil
 	profile.Status.WeeklyUsagePercent = nil
 	profile.Status.FiveHourWindowLabel = ""
 	profile.Status.WeeklyWindowLabel = ""
-	if rateLimits.Primary != nil {
-		val := rateLimits.Primary.UsedPercent
+	profile.Status.FiveHourResetsAt = nil
+	profile.Status.WeeklyResetsAt = nil
+	if snapshot.FiveHour != nil {
+		val := snapshot.FiveHour.UsedPercent
+		resetAt := snapshot.FiveHour.ResetsAt
 		profile.Status.FiveHourUsagePercent = &val
-		profile.Status.FiveHourWindowLabel = "Primary resets " + rateLimits.Primary.ResetsAt.Local().Format(time.Kitchen)
+		profile.Status.FiveHourResetsAt = &resetAt
+		profile.Status.FiveHourWindowLabel = formatWindowLabel("5-hour", snapshot.FiveHour)
 	}
-	if rateLimits.Secondary != nil {
-		val := rateLimits.Secondary.UsedPercent
+	if snapshot.Weekly != nil {
+		val := snapshot.Weekly.UsedPercent
+		resetAt := snapshot.Weekly.ResetsAt
 		profile.Status.WeeklyUsagePercent = &val
-		profile.Status.WeeklyWindowLabel = "Secondary resets " + rateLimits.Secondary.ResetsAt.Local().Format(time.Kitchen)
+		profile.Status.WeeklyResetsAt = &resetAt
+		profile.Status.WeeklyWindowLabel = formatWindowLabel("weekly", snapshot.Weekly)
 	}
+	profile.Status.LastCheckedAt = &snapshot.FetchedAt
+	profile.Status.LastError = ""
 	profile.Status.WarningState = warningState(profile.Status.FiveHourUsagePercent, profile.Status.WeeklyUsagePercent)
-	profile.Status.Health = healthState(account, profile.Status.WarningState, profile.Status.FiveHourUsagePercent, profile.Status.WeeklyUsagePercent)
+	profile.Status.Health = healthState(profile.Enabled, profile.Status.Email, profile.Status.PlanType, profile.Status.WarningState, profile.Status.FiveHourUsagePercent, profile.Status.WeeklyUsagePercent, "")
+	profile.UpdatedAt = now
 	return s.store.SaveProfile(profile)
 }
 
-func healthState(account codex.AccountInfo, warning model.ProfileWarningState, five *int, weekly *int) model.ProfileHealth {
-	if account.RequiresOpenAIAuth && account.Type == "" {
+func healthState(enabled bool, email string, planType string, warning model.ProfileWarningState, five *int, weekly *int, lastErr string) model.ProfileHealth {
+	if !enabled {
+		return model.ProfileHealthDisabled
+	}
+	if lastErr != "" {
 		return model.ProfileHealthAuthFailed
 	}
 	if overOrEqual(five, 100) || overOrEqual(weekly, 100) {
@@ -604,10 +654,35 @@ func healthState(account codex.AccountInfo, warning model.ProfileWarningState, f
 	if warning != model.ProfileWarningNone {
 		return model.ProfileHealthWarning
 	}
-	if account.Type == "" {
+	if email == "" && planType == "" {
 		return model.ProfileHealthUnknown
 	}
 	return model.ProfileHealthHealthy
+}
+
+func shouldRefreshProfile(profile model.ProfileFile) bool {
+	if !profile.Enabled {
+		return false
+	}
+	if profile.Status.LastCheckedAt == nil {
+		return true
+	}
+	age := time.Since(*profile.Status.LastCheckedAt)
+	switch {
+	case profile.Status.LastError != "":
+		return age >= errorRefreshInterval
+	case profile.Status.WarningState != model.ProfileWarningNone:
+		return age >= warningRefreshInterval
+	default:
+		return age >= profileRefreshInterval
+	}
+}
+
+func formatWindowLabel(name string, window *codex.UsageWindow) string {
+	if window == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s resets %s", name, window.ResetsAt.Local().Format("Jan 2 3:04 PM"))
 }
 
 func overOrEqual(v *int, threshold int) bool {

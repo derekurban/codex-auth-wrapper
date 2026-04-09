@@ -38,7 +38,8 @@ type RegisterSessionRequest struct {
 type Empty struct{}
 
 type HomeSnapshotRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID    string `json:"session_id"`
+	ForceRefresh bool   `json:"force_refresh"`
 }
 
 type HomeSnapshotResponse struct {
@@ -56,8 +57,16 @@ type ProfileSummary struct {
 	Enabled              bool                      `json:"enabled"`
 	Health               model.ProfileHealth       `json:"health"`
 	WarningState         model.ProfileWarningState `json:"warning_state"`
+	Email                string                    `json:"email"`
+	PlanType             string                    `json:"plan_type"`
+	LinkedAccountID      string                    `json:"linked_account_id"`
+	LinkedUserID         string                    `json:"linked_user_id"`
 	FiveHourUsagePercent *int                      `json:"five_hour_usage_percent"`
 	WeeklyUsagePercent   *int                      `json:"weekly_usage_percent"`
+	FiveHourResetsAt     *time.Time                `json:"five_hour_resets_at"`
+	WeeklyResetsAt       *time.Time                `json:"weekly_resets_at"`
+	LastCheckedAt        *time.Time                `json:"last_checked_at"`
+	LastError            string                    `json:"last_error"`
 	Selected             bool                      `json:"selected"`
 }
 

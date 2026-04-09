@@ -49,32 +49,32 @@ const (
 type ProfileHealth string
 
 const (
-	ProfileHealthUnknown   ProfileHealth = "unknown"
-	ProfileHealthHealthy   ProfileHealth = "healthy"
-	ProfileHealthWarning   ProfileHealth = "warning"
-	ProfileHealthExhausted ProfileHealth = "exhausted"
+	ProfileHealthUnknown    ProfileHealth = "unknown"
+	ProfileHealthHealthy    ProfileHealth = "healthy"
+	ProfileHealthWarning    ProfileHealth = "warning"
+	ProfileHealthExhausted  ProfileHealth = "exhausted"
 	ProfileHealthAuthFailed ProfileHealth = "auth_failed"
-	ProfileHealthDisabled  ProfileHealth = "disabled"
+	ProfileHealthDisabled   ProfileHealth = "disabled"
 )
 
 type ProfileWarningState string
 
 const (
-	ProfileWarningNone          ProfileWarningState = "none"
-	ProfileWarningFiveHour      ProfileWarningState = "five_hour_near_limit"
-	ProfileWarningWeekly        ProfileWarningState = "weekly_near_limit"
-	ProfileWarningBoth          ProfileWarningState = "both_near_limit"
+	ProfileWarningNone     ProfileWarningState = "none"
+	ProfileWarningFiveHour ProfileWarningState = "five_hour_near_limit"
+	ProfileWarningWeekly   ProfileWarningState = "weekly_near_limit"
+	ProfileWarningBoth     ProfileWarningState = "both_near_limit"
 )
 
 type StateFile struct {
-	SchemaVersion       int              `json:"schema_version"`
-	SelectedProfileID   *string          `json:"selected_profile_id"`
-	ProfileOrder        []string         `json:"profile_order"`
-	CurrentAuthEpochID  string           `json:"current_auth_epoch_id"`
+	SchemaVersion        int             `json:"schema_version"`
+	SelectedProfileID    *string         `json:"selected_profile_id"`
+	ProfileOrder         []string        `json:"profile_order"`
+	CurrentAuthEpochID   string          `json:"current_auth_epoch_id"`
 	NextAuthEpochCounter int             `json:"next_auth_epoch_counter"`
-	HomeScreen          HomeScreenState  `json:"home_screen"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
+	HomeScreen           HomeScreenState `json:"home_screen"`
+	CreatedAt            time.Time       `json:"created_at"`
+	UpdatedAt            time.Time       `json:"updated_at"`
 }
 
 type HomeScreenState struct {
@@ -83,35 +83,35 @@ type HomeScreenState struct {
 }
 
 type SessionsFile struct {
-	SchemaVersion int                       `json:"schema_version"`
-	Sessions      map[string]SessionRecord  `json:"sessions"`
-	UpdatedAt     time.Time                 `json:"updated_at"`
+	SchemaVersion int                      `json:"schema_version"`
+	Sessions      map[string]SessionRecord `json:"sessions"`
+	UpdatedAt     time.Time                `json:"updated_at"`
 }
 
 type SessionRecord struct {
-	SessionID           string        `json:"session_id"`
-	State               SessionState  `json:"state"`
-	Cwd                 string        `json:"cwd"`
-	ActiveThreadID      *string       `json:"active_thread_id"`
-	LastKnownProfileID  *string       `json:"last_known_profile_id"`
-	LastSeenAuthEpochID *string       `json:"last_seen_auth_epoch_id"`
-	ResumePending       bool          `json:"resume_pending"`
-	ResumeAllowed       bool          `json:"resume_allowed"`
-	CodexChildPID       *int          `json:"codex_child_pid"`
-	LastEnteredCodexAt  *time.Time    `json:"last_entered_codex_at"`
-	LastReturnedHomeAt  *time.Time    `json:"last_returned_home_at"`
-	CreatedAt           time.Time     `json:"created_at"`
-	UpdatedAt           time.Time     `json:"updated_at"`
+	SessionID           string       `json:"session_id"`
+	State               SessionState `json:"state"`
+	Cwd                 string       `json:"cwd"`
+	ActiveThreadID      *string      `json:"active_thread_id"`
+	LastKnownProfileID  *string      `json:"last_known_profile_id"`
+	LastSeenAuthEpochID *string      `json:"last_seen_auth_epoch_id"`
+	ResumePending       bool         `json:"resume_pending"`
+	ResumeAllowed       bool         `json:"resume_allowed"`
+	CodexChildPID       *int         `json:"codex_child_pid"`
+	LastEnteredCodexAt  *time.Time   `json:"last_entered_codex_at"`
+	LastReturnedHomeAt  *time.Time   `json:"last_returned_home_at"`
+	CreatedAt           time.Time    `json:"created_at"`
+	UpdatedAt           time.Time    `json:"updated_at"`
 }
 
 type BrokerFile struct {
-	SchemaVersion    int             `json:"schema_version"`
-	BrokerState      BrokerState     `json:"broker_state"`
-	ActiveAuthEpochID string         `json:"active_auth_epoch_id"`
-	ActiveProfileID  *string         `json:"active_profile_id"`
-	Server           ServerInfo      `json:"server"`
-	SwitchContext    SwitchContext   `json:"switch_context"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	SchemaVersion     int           `json:"schema_version"`
+	BrokerState       BrokerState   `json:"broker_state"`
+	ActiveAuthEpochID string        `json:"active_auth_epoch_id"`
+	ActiveProfileID   *string       `json:"active_profile_id"`
+	Server            ServerInfo    `json:"server"`
+	SwitchContext     SwitchContext `json:"switch_context"`
+	UpdatedAt         time.Time     `json:"updated_at"`
 }
 
 type ServerInfo struct {
@@ -123,34 +123,41 @@ type ServerInfo struct {
 }
 
 type SwitchContext struct {
-	InProgress         bool       `json:"in_progress"`
-	FromProfileID      *string    `json:"from_profile_id"`
-	ToProfileID        *string    `json:"to_profile_id"`
-	InitiatedBySessionID *string  `json:"initiated_by_session_id"`
-	InitiatedAt        *time.Time `json:"initiated_at"`
+	InProgress           bool       `json:"in_progress"`
+	FromProfileID        *string    `json:"from_profile_id"`
+	ToProfileID          *string    `json:"to_profile_id"`
+	InitiatedBySessionID *string    `json:"initiated_by_session_id"`
+	InitiatedAt          *time.Time `json:"initiated_at"`
 }
 
 type ProfileFile struct {
-	SchemaVersion    int                `json:"schema_version"`
-	ID               string             `json:"id"`
-	Name             string             `json:"name"`
-	Enabled          bool               `json:"enabled"`
-	AuthFile         string             `json:"auth_file"`
-	SelectionPriority int               `json:"selection_priority"`
-	Status           ProfileStatus      `json:"status"`
-	LastSelectedAt   *time.Time         `json:"last_selected_at"`
-	CreatedAt        time.Time          `json:"created_at"`
-	UpdatedAt        time.Time          `json:"updated_at"`
+	SchemaVersion     int           `json:"schema_version"`
+	ID                string        `json:"id"`
+	Name              string        `json:"name"`
+	Enabled           bool          `json:"enabled"`
+	AuthFile          string        `json:"auth_file"`
+	SelectionPriority int           `json:"selection_priority"`
+	Status            ProfileStatus `json:"status"`
+	LastSelectedAt    *time.Time    `json:"last_selected_at"`
+	CreatedAt         time.Time     `json:"created_at"`
+	UpdatedAt         time.Time     `json:"updated_at"`
 }
 
 type ProfileStatus struct {
 	Health               ProfileHealth       `json:"health"`
+	Email                string              `json:"email"`
+	PlanType             string              `json:"plan_type"`
+	LinkedAccountID      string              `json:"linked_account_id"`
+	LinkedUserID         string              `json:"linked_user_id"`
 	FiveHourUsagePercent *int                `json:"five_hour_usage_percent"`
 	WeeklyUsagePercent   *int                `json:"weekly_usage_percent"`
 	FiveHourWindowLabel  string              `json:"five_hour_window_label"`
 	WeeklyWindowLabel    string              `json:"weekly_window_label"`
+	FiveHourResetsAt     *time.Time          `json:"five_hour_resets_at"`
+	WeeklyResetsAt       *time.Time          `json:"weekly_resets_at"`
 	LastCheckedAt        *time.Time          `json:"last_checked_at"`
 	WarningState         ProfileWarningState `json:"warning_state"`
+	LastError            string              `json:"last_error"`
 }
 
 func NewInitialState(now time.Time) StateFile {
