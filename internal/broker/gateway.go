@@ -127,12 +127,14 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 	errCh := make(chan error, 2)
 
 	go func() {
-		errCh <- proxyFrames(clientConn, backendConn, func(data []byte) {
+		errCh <- proxyFrames(clientConn, backendConn, func(data []byte) []byte {
+			return s.rewriteClientMessage(sessionID, data)
+		}, func(data []byte) {
 			state.trackClientMessage(data)
 		})
 	}()
 	go func() {
-		errCh <- proxyFrames(backendConn, clientConn, func(data []byte) {
+		errCh <- proxyFrames(backendConn, clientConn, nil, func(data []byte) {
 			if thread, ok := state.trackServerMessage(data); ok {
 				if err := s.updateSessionActiveThread(sessionID, thread); err != nil {
 					s.setDegraded(err)
@@ -144,14 +146,19 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 	<-errCh
 }
 
-func proxyFrames(src *websocket.Conn, dst *websocket.Conn, inspect func([]byte)) error {
+func proxyFrames(src *websocket.Conn, dst *websocket.Conn, rewrite func([]byte) []byte, inspect func([]byte)) error {
 	for {
 		messageType, data, err := src.ReadMessage()
 		if err != nil {
 			return err
 		}
-		if messageType == websocket.TextMessage && inspect != nil {
-			inspect(data)
+		if messageType == websocket.TextMessage {
+			if rewrite != nil {
+				data = rewrite(data)
+			}
+			if inspect != nil {
+				inspect(data)
+			}
 		}
 		if err := dst.WriteMessage(messageType, data); err != nil {
 			return err
@@ -172,6 +179,56 @@ func (s *Service) gatewayAuthContext(r *http.Request) (string, string, string, b
 		return "", "", "", false
 	}
 	return sessionID, s.appServerURL, s.appServerToken, true
+}
+
+func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
+	cwd, ok := s.threadListFilterCwd(sessionID)
+	if !ok {
+		return data
+	}
+
+	var msg map[string]any
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return data
+	}
+	method, _ := msg["method"].(string)
+	if method != "thread/list" {
+		return data
+	}
+
+	params, _ := msg["params"].(map[string]any)
+	if params == nil {
+		params = map[string]any{}
+	}
+	if rawCwd, exists := params["cwd"]; exists && rawCwd != nil && fmt.Sprint(rawCwd) != "" {
+		return data
+	}
+
+	params["cwd"] = cwd
+	msg["params"] = params
+	rewritten, err := json.Marshal(msg)
+	if err != nil {
+		return data
+	}
+	return rewritten
+}
+
+func (s *Service) threadListFilterCwd(sessionID string) (string, bool) {
+	sessions, err := s.store.LoadSessions()
+	if err != nil {
+		return "", false
+	}
+	record, ok := sessions.Sessions[sessionID]
+	if !ok {
+		return "", false
+	}
+	if record.ActiveThreadCwd != nil && *record.ActiveThreadCwd != "" {
+		return *record.ActiveThreadCwd, true
+	}
+	if record.Cwd != "" {
+		return record.Cwd, true
+	}
+	return "", false
 }
 
 func (s *Service) updateSessionActiveThread(sessionID string, thread trackedThread) error {
