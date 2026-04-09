@@ -47,6 +47,9 @@ func LaunchRemote(spec ipc.LaunchSpec, codexHome string) error {
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		args = append(args, "resume", *spec.ThreadID)
 	}
+	if spec.SelectedCwd != "" {
+		args = append(args, "-C", spec.SelectedCwd)
+	}
 	args = append(args,
 		"--remote", spec.GatewayURL,
 		"--remote-auth-token-env", spec.TokenEnvName,
