@@ -16,6 +16,8 @@ import (
 const (
 	defaultRefreshInterval = 45 * time.Second
 	warningRefreshInterval = 15 * time.Second
+	pageHorizontalPadding  = 3
+	pageVerticalPadding    = 1
 )
 
 type ActionType string
@@ -48,6 +50,8 @@ type Model struct {
 	selectedIndex int
 	scrollOffset  int
 	snapshot      ipc.HomeSnapshotResponse
+	hasSnapshot   bool
+	isLoading     bool
 	statusMessage string
 	errMessage    string
 	action        Action
@@ -78,6 +82,7 @@ func Run(client *ipc.Client, sessionID string, statusMessage string) (Action, er
 		client:        client,
 		sessionID:     sessionID,
 		screen:        screenHome,
+		isLoading:     true,
 		statusMessage: statusMessage,
 		nameInput:     nameInput,
 		idInput:       idInput,
@@ -109,9 +114,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
+			m.isLoading = false
 			return m, nil
 		}
 		m.errMessage = ""
+		m.isLoading = false
+		m.hasSnapshot = true
 		m.snapshot = msg.snapshot
 		m.syncSelection()
 		return m, nil
@@ -150,6 +158,7 @@ func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.action = Action{Type: ActionQuit}
 		return m, tea.Quit
 	case "r":
+		m.isLoading = true
 		return m, m.refreshCmd(true)
 	case "a":
 		m.screen = screenAdd
@@ -264,8 +273,7 @@ func (m Model) View() string {
 		Foreground(lipgloss.Color("#F4EEE1")).
 		Background(lipgloss.Color("#11151C")).
 		Width(m.width).
-		Height(m.height).
-		Padding(1, 3)
+		Padding(pageVerticalPadding, pageHorizontalPadding)
 
 	title := lipgloss.NewStyle().
 		Bold(true).
@@ -280,13 +288,13 @@ func (m Model) View() string {
 	case screenAdd:
 		body = m.viewAdd()
 	default:
-		body = m.viewHome()
+		body = m.viewHome(m.availableBodyHeight())
 	}
 
 	return pageStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, subtitle, "", body))
 }
 
-func (m Model) viewHome() string {
+func (m Model) viewHome(bodyHeight int) string {
 	contentWidth := m.contentWidth()
 	primary := "Press Enter to set up your first account"
 	if len(m.snapshot.Profiles) > 0 {
@@ -304,6 +312,16 @@ func (m Model) viewHome() string {
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  space select account  r refresh all  q quit"),
 		}, "\n\n"))
 
+	if !m.hasSnapshot && m.isLoading {
+		loadingPanel := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#2A3B47")).
+			Padding(1, 2).
+			Width(contentWidth).
+			Render("Loading profiles...\n\nFetching stored account metadata and live usage snapshots.")
+		return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", loadingPanel)
+	}
+
 	if len(m.snapshot.Profiles) == 0 {
 		emptyPanel := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -314,7 +332,7 @@ func (m Model) viewHome() string {
 		return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", emptyPanel)
 	}
 
-	listHeight := m.availableListHeight(lipgloss.Height(headerPanel))
+	listHeight := m.availableListHeight(bodyHeight, lipgloss.Height(headerPanel))
 	return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", m.renderProfilesList(contentWidth, listHeight))
 }
 
@@ -327,6 +345,9 @@ func (m Model) renderStatusLine() string {
 	}
 	if strings.TrimSpace(m.statusMessage) != "" {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(m.statusMessage)
+	}
+	if m.isLoading && !m.hasSnapshot {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Loading account data...")
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically and `r` forces a fresh pass across every stored account.")
 }
@@ -433,21 +454,23 @@ func (m *Model) ensureSelectionVisible(visibleRows int) {
 }
 
 func (m Model) visibleProfileRows() int {
-	contentWidth := m.contentWidth()
-	_ = contentWidth
 	headerHeight := 8
-	listHeight := m.availableListHeight(headerHeight)
+	listHeight := m.availableListHeight(m.availableBodyHeight(), headerHeight)
 	return max(1, (listHeight-2)/3)
 }
 
-func (m Model) availableListHeight(headerHeight int) int {
-	bodyHeight := m.height - 6
+func (m Model) availableListHeight(bodyHeight int, headerHeight int) int {
 	listHeight := bodyHeight - headerHeight - 1
 	return max(5, listHeight)
 }
 
 func (m Model) contentWidth() int {
-	return max(48, m.width-10)
+	return max(48, m.width-(pageHorizontalPadding*2)-4)
+}
+
+func (m Model) availableBodyHeight() int {
+	titleBlockHeight := 3
+	return max(8, m.height-(pageVerticalPadding*2)-titleBlockHeight)
 }
 
 func (m Model) viewAdd() string {
@@ -528,7 +551,11 @@ func compactUsageSegment(label string, used *int, resetsAt *time.Time) string {
 	if used == nil {
 		return label + " [----------] n/a"
 	}
-	segment := fmt.Sprintf("%s %s %d%%", label, progressBar(*used, 10), *used)
+	remaining := 100 - *used
+	if remaining < 0 {
+		remaining = 0
+	}
+	segment := fmt.Sprintf("%s %s %d%% left", label, progressBar(remaining, 10), remaining)
 	if resetsAt != nil {
 		segment += "  " + relativeReset(*resetsAt)
 	}
