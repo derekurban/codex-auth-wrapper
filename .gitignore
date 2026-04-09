@@ -1,1 +1,5 @@
 hidden/
+dist/
+*.exe
+*.test
+*.out
