@@ -26,7 +26,7 @@ func (s *Store) EnsureLayout(now time.Time) error {
 		s.Paths.LogsDir,
 		s.Paths.ProfilesDir,
 		s.Paths.RuntimeDir,
-		s.Paths.RuntimeCodexHome,
+		s.Paths.CodexHome,
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -124,12 +124,12 @@ func (s *Store) ListProfiles() ([]model.ProfileFile, error) {
 
 func (s *Store) CopyProfileAuthToRuntime(profileID string) error {
 	src := s.Paths.ProfileAuthFile(profileID)
-	dst := s.Paths.RuntimeAuthFile
+	dst := s.Paths.CodexAuthFile
 	return copyFile(src, dst)
 }
 
 func (s *Store) CopyRuntimeAuthToProfile(profileID string) error {
-	src := s.Paths.RuntimeAuthFile
+	src := s.Paths.CodexAuthFile
 	if _, err := os.Stat(src); err != nil {
 		return err
 	}
@@ -186,4 +186,21 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+func copyDirRecursive(srcRoot, dstRoot string) error {
+	return filepath.WalkDir(srcRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dstRoot, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return copyFile(path, target)
+	})
 }

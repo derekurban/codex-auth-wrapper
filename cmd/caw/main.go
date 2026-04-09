@@ -213,21 +213,32 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, sessionID string, cw
 		return "", err
 	}
 	fmt.Println()
-	fmt.Println("Launching stock Codex connected to the shared wrapper-managed app-server.")
+	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
+		fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
+	} else {
+		fmt.Println("Launching stock Codex connected to the shared wrapper-managed app-server.")
+	}
 	fmt.Println("Exit Codex normally to return to the wrapper home. F12 interception is not wired yet in this build.")
 	fmt.Println()
-	err := codex.LaunchRemote(spec, paths.RuntimeCodexHome)
+	err := codex.LaunchRemote(spec, paths.CodexHome)
 	homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer homeCancel()
 	_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return "Returned from Codex.", nil
+			return returnHomeMessage(spec), nil
 		}
 		return "", err
 	}
-	return "Returned from Codex.", nil
+	return returnHomeMessage(spec), nil
+}
+
+func returnHomeMessage(spec ipc.LaunchSpec) string {
+	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
+		return fmt.Sprintf("Returned from Codex. Enter resumes thread %s.", *spec.ThreadID)
+	}
+	return "Returned from Codex."
 }
 
 func ensureClient(paths store.Paths) (*ipc.Client, error) {

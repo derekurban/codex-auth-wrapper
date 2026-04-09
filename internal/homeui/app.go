@@ -3,6 +3,7 @@ package homeui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -299,18 +300,26 @@ func (m Model) viewHome(bodyHeight int) string {
 	primary := "Press Enter to set up your first account"
 	if len(m.snapshot.Profiles) > 0 {
 		primary = "Press Enter to continue into Codex"
+		if m.snapshot.Session != nil && m.snapshot.Session.ActiveThreadID != nil && *m.snapshot.Session.ActiveThreadID != "" {
+			primary = "Press Enter to resume your active Codex thread"
+		}
 	}
+
+	headerLines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7BD389")).Render(primary),
+		m.renderStatusLine(),
+	}
+	if sessionLine := m.renderSessionLine(); sessionLine != "" {
+		headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(sessionLine))
+	}
+	headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  space select account  r refresh all  q quit"))
 
 	headerPanel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#2A3B47")).
 		Padding(1, 2).
 		Width(contentWidth).
-		Render(strings.Join([]string{
-			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7BD389")).Render(primary),
-			m.renderStatusLine(),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  space select account  r refresh all  q quit"),
-		}, "\n\n"))
+		Render(strings.Join(headerLines, "\n\n"))
 
 	if !m.hasSnapshot && m.isLoading {
 		loadingPanel := lipgloss.NewStyle().
@@ -350,6 +359,17 @@ func (m Model) renderStatusLine() string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Loading account data...")
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically and `r` forces a fresh pass across every stored account.")
+}
+
+func (m Model) renderSessionLine() string {
+	if m.snapshot.Session == nil || m.snapshot.Session.ActiveThreadID == nil || *m.snapshot.Session.ActiveThreadID == "" {
+		return ""
+	}
+	parts := []string{"Tracked thread " + shortenID(*m.snapshot.Session.ActiveThreadID)}
+	if m.snapshot.Session.ActiveThreadCwd != nil && *m.snapshot.Session.ActiveThreadCwd != "" {
+		parts = append(parts, "cwd "+compactPathLabel(*m.snapshot.Session.ActiveThreadCwd))
+	}
+	return strings.Join(parts, "  •  ")
 }
 
 func (m *Model) renderProfilesList(width int, listHeight int) string {
@@ -454,9 +474,17 @@ func (m *Model) ensureSelectionVisible(visibleRows int) {
 }
 
 func (m Model) visibleProfileRows() int {
-	headerHeight := 8
+	headerHeight := m.homeHeaderHeightEstimate()
 	listHeight := m.availableListHeight(m.availableBodyHeight(), headerHeight)
 	return max(1, (listHeight-2)/3)
+}
+
+func (m Model) homeHeaderHeightEstimate() int {
+	height := 8
+	if m.snapshot.Session != nil && m.snapshot.Session.ActiveThreadID != nil && *m.snapshot.Session.ActiveThreadID != "" {
+		height += 2
+	}
+	return height
 }
 
 func (m Model) availableListHeight(bodyHeight int, headerHeight int) int {
@@ -650,6 +678,14 @@ func progressBar(percent int, width int) string {
 		filled = width
 	}
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
+}
+
+func compactPathLabel(path string) string {
+	base := filepath.Base(path)
+	if base == "." || base == string(filepath.Separator) || strings.TrimSpace(base) == "" {
+		return path
+	}
+	return base
 }
 
 func (m Model) refreshCmd(force bool) tea.Cmd {

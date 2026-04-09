@@ -93,6 +93,7 @@ type SessionRecord struct {
 	State               SessionState `json:"state"`
 	Cwd                 string       `json:"cwd"`
 	ActiveThreadID      *string      `json:"active_thread_id"`
+	ActiveThreadCwd     *string      `json:"active_thread_cwd"`
 	LastKnownProfileID  *string      `json:"last_known_profile_id"`
 	LastSeenAuthEpochID *string      `json:"last_seen_auth_epoch_id"`
 	ResumePending       bool         `json:"resume_pending"`

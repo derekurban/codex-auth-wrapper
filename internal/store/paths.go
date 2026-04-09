@@ -6,25 +6,25 @@ import (
 )
 
 const (
-	WrapperDirName = ".codex-auth-wrapper"
-	ProfilesDir    = "profiles"
-	RuntimeDir     = "runtime"
-	CodexHomeDir   = "codex-home"
-	LogsDir        = "logs"
+	WrapperDirName      = ".codex-auth-wrapper"
+	DefaultCodexDirName = ".codex"
+	ProfilesDir         = "profiles"
+	RuntimeDir          = "runtime"
+	LogsDir             = "logs"
 )
 
 type Paths struct {
-	Root             string
-	StateFile        string
-	SessionsFile     string
-	BrokerFile       string
-	EventsFile       string
-	LogsDir          string
-	ProfilesDir      string
-	RuntimeDir       string
-	RuntimeCodexHome string
-	RuntimeAuthFile  string
-	RuntimeConfigToml string
+	Root               string
+	StateFile          string
+	SessionsFile       string
+	BrokerFile         string
+	EventsFile         string
+	LogsDir            string
+	ProfilesDir        string
+	RuntimeDir         string
+	CodexHome          string
+	CodexAuthFile      string
+	CodexConfigToml    string
 	AppServerTokenFile string
 }
 
@@ -34,11 +34,10 @@ func DefaultPaths() (Paths, error) {
 		return Paths{}, err
 	}
 	root := filepath.Join(home, WrapperDirName)
-	return NewPaths(root), nil
+	return NewPaths(root, filepath.Join(home, DefaultCodexDirName)), nil
 }
 
-func NewPaths(root string) Paths {
-	runtimeCodexHome := filepath.Join(root, RuntimeDir, CodexHomeDir)
+func NewPaths(root string, codexHome string) Paths {
 	return Paths{
 		Root:               root,
 		StateFile:          filepath.Join(root, "state.json"),
@@ -48,9 +47,9 @@ func NewPaths(root string) Paths {
 		LogsDir:            filepath.Join(root, LogsDir),
 		ProfilesDir:        filepath.Join(root, ProfilesDir),
 		RuntimeDir:         filepath.Join(root, RuntimeDir),
-		RuntimeCodexHome:   runtimeCodexHome,
-		RuntimeAuthFile:    filepath.Join(runtimeCodexHome, "auth.json"),
-		RuntimeConfigToml:  filepath.Join(runtimeCodexHome, "config.toml"),
+		CodexHome:          codexHome,
+		CodexAuthFile:      filepath.Join(codexHome, "auth.json"),
+		CodexConfigToml:    filepath.Join(codexHome, "config.toml"),
 		AppServerTokenFile: filepath.Join(root, RuntimeDir, "app-server-token.txt"),
 	}
 }

@@ -37,17 +37,21 @@ type Service struct {
 
 	mu             sync.Mutex
 	server         *ipc.Server
+	gateway        *gatewayServer
 	appServerCmd   *exec.Cmd
 	appServerURL   string
 	appServerToken string
+	gatewayURL     string
+	sessionTokens  map[string]string
 	control        *codex.AppServerClient
 	degradedReason string
 }
 
 func New(paths store.Paths) *Service {
 	return &Service{
-		paths: paths,
-		store: store.New(paths),
+		paths:         paths,
+		store:         store.New(paths),
+		sessionTokens: map[string]string{},
 	}
 }
 
@@ -56,14 +60,15 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.store.EnsureLayout(now); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.paths.RuntimeConfigToml, []byte("cli_auth_credentials_store = \"file\"\n"), 0o644); err != nil {
-		return err
-	}
 	if err := s.reconcileStartup(ctx); err != nil {
 		s.setDegraded(err)
 	}
+	if err := s.startGateway(ctx); err != nil {
+		return err
+	}
 	srv, err := ipc.Listen(s.handleIPC)
 	if err != nil {
+		s.shutdownGateway()
 		return err
 	}
 	s.mu.Lock()
@@ -72,6 +77,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
+		s.shutdownGateway()
 		s.shutdownAppServer()
 	}()
 	return srv.Serve(ctx)
@@ -157,6 +163,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 	case "broker.stop":
 		go func() {
 			time.Sleep(50 * time.Millisecond)
+			s.shutdownGateway()
 			s.shutdownAppServer()
 			s.mu.Lock()
 			server := s.server
@@ -351,6 +358,10 @@ func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchReques
 	if !ok {
 		return ipc.LaunchSpec{}, fmt.Errorf("session %q not registered", req.SessionID)
 	}
+	selectedCwd := req.Cwd
+	if record.ActiveThreadID != nil && record.ResumeAllowed && record.ActiveThreadCwd != nil && *record.ActiveThreadCwd != "" {
+		selectedCwd = *record.ActiveThreadCwd
+	}
 	now := time.Now()
 	record.State = model.SessionStateLaunchingCodex
 	record.Cwd = req.Cwd
@@ -366,17 +377,21 @@ func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchReques
 	if record.ActiveThreadID != nil && record.ResumeAllowed {
 		mode = ipc.LaunchModeResume
 	}
+	sessionToken, err := s.issueSessionToken(req.SessionID)
+	if err != nil {
+		return ipc.LaunchSpec{}, err
+	}
 	s.mu.Lock()
 	spec := ipc.LaunchSpec{
 		SessionID:    req.SessionID,
 		ProfileID:    *state.SelectedProfileID,
 		AuthEpochID:  state.CurrentAuthEpochID,
-		GatewayURL:   s.appServerURL,
+		GatewayURL:   s.gatewayURL,
 		TokenEnvName: codex.RemoteAuthTokenEnv,
-		Token:        s.appServerToken,
+		Token:        sessionToken,
 		ThreadID:     record.ActiveThreadID,
 		Mode:         mode,
-		SelectedCwd:  req.Cwd,
+		SelectedCwd:  selectedCwd,
 	}
 	s.mu.Unlock()
 	return spec, nil
@@ -411,6 +426,7 @@ func (s *Service) unregisterSession(sessionID string) error {
 		return err
 	}
 	if _, ok := sessions.Sessions[sessionID]; !ok {
+		s.revokeSessionTokens(sessionID)
 		s.maybeScheduleIdleShutdown()
 		return nil
 	}
@@ -419,6 +435,7 @@ func (s *Service) unregisterSession(sessionID string) error {
 	if err := s.store.SaveSessions(sessions); err != nil {
 		return err
 	}
+	s.revokeSessionTokens(sessionID)
 	s.maybeScheduleIdleShutdown()
 	return nil
 }
@@ -470,9 +487,6 @@ func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
 
 func (s *Service) activateProfile(ctx context.Context, profileID string, reason string) error {
 	if err := s.store.CopyProfileAuthToRuntime(profileID); err != nil {
-		return err
-	}
-	if err := os.WriteFile(s.paths.RuntimeConfigToml, []byte("cli_auth_credentials_store = \"file\"\n"), 0o644); err != nil {
 		return err
 	}
 	s.shutdownAppServer()
@@ -532,7 +546,7 @@ func (s *Service) startAppServer(ctx context.Context, profileID, reason string) 
 		"-c", "cli_auth_credentials_store=file",
 	)
 	cmd.Env = append(os.Environ(),
-		"CODEX_HOME="+s.paths.RuntimeCodexHome,
+		"CODEX_HOME="+s.paths.CodexHome,
 		"LOG_FORMAT=json",
 	)
 	logFile := filepath.Join(s.paths.LogsDir, "broker-app-server.log")
@@ -778,6 +792,7 @@ func (s *Service) maybeScheduleIdleShutdown() {
 		if len(sessions.Sessions) > 0 {
 			return
 		}
+		s.shutdownGateway()
 		s.shutdownAppServer()
 		s.mu.Lock()
 		server := s.server
@@ -807,6 +822,32 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func (s *Service) issueSessionToken(sessionID string) (string, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for existingToken, existingSessionID := range s.sessionTokens {
+		if existingSessionID == sessionID {
+			delete(s.sessionTokens, existingToken)
+		}
+	}
+	s.sessionTokens[token] = sessionID
+	return token, nil
+}
+
+func (s *Service) revokeSessionTokens(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for token, existingSessionID := range s.sessionTokens {
+		if existingSessionID == sessionID {
+			delete(s.sessionTokens, token)
+		}
+	}
 }
 
 func waitForReady(ctx context.Context, rawWSURL string, timeout time.Duration) error {
