@@ -192,16 +192,29 @@ func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
 		return data
 	}
 	method, _ := msg["method"].(string)
-	if method != "thread/list" && method != "thread/start" {
+	switch method {
+	case "initialize":
+		params, _ := msg["params"].(map[string]any)
+		if params == nil {
+			return data
+		}
+		clientInfo, _ := params["clientInfo"].(map[string]any)
+		if clientInfo == nil {
+			return data
+		}
+		clientInfo["cwd"] = cwd
+		params["clientInfo"] = clientInfo
+		msg["params"] = params
+	case "thread/list", "thread/start":
+		params, _ := msg["params"].(map[string]any)
+		if params == nil {
+			params = map[string]any{}
+		}
+		params["cwd"] = cwd
+		msg["params"] = params
+	default:
 		return data
 	}
-
-	params, _ := msg["params"].(map[string]any)
-	if params == nil {
-		params = map[string]any{}
-	}
-	params["cwd"] = cwd
-	msg["params"] = params
 	rewritten, err := json.Marshal(msg)
 	if err != nil {
 		return data
