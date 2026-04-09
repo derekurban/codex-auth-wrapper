@@ -16,6 +16,13 @@ go install github.com/derekurban/codex-auth-wrapper/cmd/caw@latest
 iwr https://raw.githubusercontent.com/derekurban/codex-auth-wrapper/main/scripts/install.ps1 -useb | iex
 ```
 
+The installer:
+- downloads and verifies the tagged release asset
+- installs `caw.exe`
+- writes a `caw.cmd` shim beside it
+- adds the install directory to your user `PATH`
+- updates the current session `PATH` so `caw` works immediately
+
 ## Verify
 
 After installation, run:

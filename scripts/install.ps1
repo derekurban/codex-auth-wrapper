@@ -68,6 +68,50 @@ function Download-Force {
   Invoke-WebRequest -Uri $Uri -OutFile $OutFile
 }
 
+function Normalize-PathEntry {
+  param([string]$PathEntry)
+  if (-not $PathEntry) {
+    return $null
+  }
+  return [System.IO.Path]::TrimEndingDirectorySeparator($PathEntry).ToLowerInvariant()
+}
+
+function Path-ContainsEntry {
+  param(
+    [string]$PathValue,
+    [string]$Candidate
+  )
+
+  $NormalizedCandidate = Normalize-PathEntry $Candidate
+  if (-not $NormalizedCandidate) {
+    return $false
+  }
+
+  foreach ($Entry in ($PathValue -split ';')) {
+    if ((Normalize-PathEntry $Entry) -eq $NormalizedCandidate) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Ensure-PathContains {
+  param([string]$Directory)
+
+  if (-not (Path-ContainsEntry -PathValue $env:Path -Candidate $Directory)) {
+    $env:Path = if ($env:Path) { "$Directory;$env:Path" } else { $Directory }
+    Write-Host "Added $Directory to the current session PATH"
+  }
+
+  $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if (-not (Path-ContainsEntry -PathValue $UserPath -Candidate $Directory)) {
+    $UpdatedUserPath = if ($UserPath) { "$Directory;$UserPath" } else { $Directory }
+    [Environment]::SetEnvironmentVariable("Path", $UpdatedUserPath, "User")
+    Write-Host "Added $Directory to the user PATH"
+  }
+}
+
 $ResolvedVersion = Resolve-Version -RequestedVersion $Version
 $AssetVersion = $ResolvedVersion -replace '^v', ''
 $Arch = Resolve-Arch
@@ -116,12 +160,16 @@ try {
   }
 
   $Destination = Join-Path $InstallDir "$Binary.exe"
+  $ShimPath = Join-Path $InstallDir "$Binary.cmd"
   Copy-Item -Path $BinaryPath.FullName -Destination $Destination -Force
+  Set-Content -Path $ShimPath -Value "@echo off`r`n""%~dp0$Binary.exe"" %*`r`n" -NoNewline
+  Ensure-PathContains -Directory $InstallDir
   Write-Host "Installed $Binary $ResolvedVersion to $Destination"
+  Write-Host "Installed command shim to $ShimPath"
   Write-Host "Using release cache at $VersionCacheDir"
 
   if (-not $NoCheck) {
-    & $Destination --version
+    & $Binary --version
   }
 }
 finally {
