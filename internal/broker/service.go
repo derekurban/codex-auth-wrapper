@@ -134,6 +134,12 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 			return nil, err
 		}
 		return s.prepareLaunch(ctx, req)
+	case "settings.update":
+		var req ipc.UpdateSettingsRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return ipc.Empty{}, s.updateSettings(req)
 	case "session.return_home":
 		var req ipc.ReturnHomeRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -248,6 +254,9 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 	resp := ipc.HomeSnapshotResponse{
 		SelectedProfileID: state.SelectedProfileID,
 		Profiles:          summaries,
+		Settings: ipc.WrapperSettings{
+			ClearTerminalBeforeLaunch: state.Settings.ClearTerminalEnabled(),
+		},
 		BrokerState:       brokerState.BrokerState,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
 	}
@@ -392,9 +401,24 @@ func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchReques
 		ThreadID:     record.ActiveThreadID,
 		Mode:         mode,
 		SelectedCwd:  selectedCwd,
+		Settings: ipc.WrapperSettings{
+			ClearTerminalBeforeLaunch: state.Settings.ClearTerminalEnabled(),
+		},
 	}
 	s.mu.Unlock()
 	return spec, nil
+}
+
+func (s *Service) updateSettings(req ipc.UpdateSettingsRequest) error {
+	state, err := s.store.LoadState()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	value := req.ClearTerminalBeforeLaunch
+	state.Settings.ClearTerminalBeforeLaunch = &value
+	state.UpdatedAt = now
+	return s.store.SaveState(state)
 }
 
 func (s *Service) returnHome(sessionID string) error {

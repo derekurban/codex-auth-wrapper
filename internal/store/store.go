@@ -54,10 +54,15 @@ func (s *Store) EnsureLayout(now time.Time) error {
 func (s *Store) LoadState() (model.StateFile, error) {
 	var out model.StateFile
 	err := readJSONFile(s.Paths.StateFile, &out)
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	out = normalizeStateDefaults(out)
+	return out, nil
 }
 
 func (s *Store) SaveState(in model.StateFile) error {
+	in = normalizeStateDefaults(in)
 	return writeJSONAtomic(s.Paths.StateFile, in)
 }
 
@@ -203,4 +208,15 @@ func copyDirRecursive(srcRoot, dstRoot string) error {
 		}
 		return copyFile(path, target)
 	})
+}
+
+func normalizeStateDefaults(in model.StateFile) model.StateFile {
+	if in.Settings.ClearTerminalBeforeLaunch == nil {
+		in.Settings.ClearTerminalBeforeLaunch = boolPtr(true)
+	}
+	return in
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }

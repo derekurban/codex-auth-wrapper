@@ -73,6 +73,7 @@ type StateFile struct {
 	CurrentAuthEpochID   string          `json:"current_auth_epoch_id"`
 	NextAuthEpochCounter int             `json:"next_auth_epoch_counter"`
 	HomeScreen           HomeScreenState `json:"home_screen"`
+	Settings             WrapperSettings `json:"settings"`
 	CreatedAt            time.Time       `json:"created_at"`
 	UpdatedAt            time.Time       `json:"updated_at"`
 }
@@ -80,6 +81,17 @@ type StateFile struct {
 type HomeScreenState struct {
 	LastFocus              HomeFocus `json:"last_focus"`
 	LastSelectedAccountRow *string   `json:"last_selected_account_row"`
+}
+
+type WrapperSettings struct {
+	ClearTerminalBeforeLaunch *bool `json:"clear_terminal_before_launch,omitempty"`
+}
+
+func (s WrapperSettings) ClearTerminalEnabled() bool {
+	if s.ClearTerminalBeforeLaunch == nil {
+		return true
+	}
+	return *s.ClearTerminalBeforeLaunch
 }
 
 type SessionsFile struct {
@@ -170,6 +182,9 @@ func NewInitialState(now time.Time) StateFile {
 		HomeScreen: HomeScreenState{
 			LastFocus: HomeFocusPrimaryAction,
 		},
+		Settings: WrapperSettings{
+			ClearTerminalBeforeLaunch: boolPtr(true),
+		},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -194,4 +209,8 @@ func NewInitialBroker(now time.Time) BrokerFile {
 		SwitchContext: SwitchContext{},
 		UpdatedAt:     now,
 	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }

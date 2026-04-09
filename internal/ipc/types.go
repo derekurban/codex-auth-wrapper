@@ -46,9 +46,14 @@ type HomeSnapshotResponse struct {
 	SelectedProfileID *string              `json:"selected_profile_id"`
 	Profiles          []ProfileSummary     `json:"profiles"`
 	Session           *model.SessionRecord `json:"session"`
+	Settings          WrapperSettings      `json:"settings"`
 	BrokerState       model.BrokerState    `json:"broker_state"`
 	ActiveAuthEpochID string               `json:"active_auth_epoch_id"`
 	DegradedReason    *string              `json:"degraded_reason"`
+}
+
+type WrapperSettings struct {
+	ClearTerminalBeforeLaunch bool `json:"clear_terminal_before_launch"`
 }
 
 type ProfileSummary struct {
@@ -94,15 +99,20 @@ const (
 )
 
 type LaunchSpec struct {
-	SessionID    string     `json:"session_id"`
-	ProfileID    string     `json:"profile_id"`
-	AuthEpochID  string     `json:"auth_epoch_id"`
-	GatewayURL   string     `json:"gateway_url"`
-	TokenEnvName string     `json:"token_env_name"`
-	Token        string     `json:"token"`
-	ThreadID     *string    `json:"thread_id"`
-	Mode         LaunchMode `json:"mode"`
-	SelectedCwd  string     `json:"selected_cwd"`
+	SessionID    string          `json:"session_id"`
+	ProfileID    string          `json:"profile_id"`
+	AuthEpochID  string          `json:"auth_epoch_id"`
+	GatewayURL   string          `json:"gateway_url"`
+	TokenEnvName string          `json:"token_env_name"`
+	Token        string          `json:"token"`
+	ThreadID     *string         `json:"thread_id"`
+	Mode         LaunchMode      `json:"mode"`
+	SelectedCwd  string          `json:"selected_cwd"`
+	Settings     WrapperSettings `json:"settings"`
+}
+
+type UpdateSettingsRequest struct {
+	ClearTerminalBeforeLaunch bool `json:"clear_terminal_before_launch"`
 }
 
 type ReturnHomeRequest struct {

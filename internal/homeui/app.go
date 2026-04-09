@@ -38,8 +38,9 @@ type Action struct {
 type screen string
 
 const (
-	screenHome screen = "home"
-	screenAdd  screen = "add"
+	screenHome     screen = "home"
+	screenAdd      screen = "add"
+	screenSettings screen = "settings"
 )
 
 type Model struct {
@@ -130,6 +131,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateHome(msg)
 		case screenAdd:
 			return m.updateAdd(msg)
+		case screenSettings:
+			return m.updateSettings(msg)
 		}
 	}
 	return m, nil
@@ -169,6 +172,10 @@ func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.idInput.SetValue("")
 		m.nameInput.Focus()
 		m.idInput.Blur()
+		return m, nil
+	case "s":
+		m.screen = screenSettings
+		m.errMessage = ""
 		return m, nil
 	case "up", "k":
 		if m.selectedIndex > 0 {
@@ -266,6 +273,32 @@ func (m Model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.action = Action{Type: ActionQuit}
+		return m, tea.Quit
+	case "esc", "s":
+		m.screen = screenHome
+		m.errMessage = ""
+		return m, m.refreshCmd(false)
+	case "enter", " ":
+		nextValue := !m.snapshot.Settings.ClearTerminalBeforeLaunch
+		m.isLoading = true
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := m.client.Request(ctx, "settings.update", ipc.UpdateSettingsRequest{
+				ClearTerminalBeforeLaunch: nextValue,
+			}, nil); err != nil {
+				return snapshotMsg{err: err}
+			}
+			return loadSnapshot(m.client, m.sessionID, true)
+		}
+	}
+	return m, nil
+}
+
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "Loading Codex Auth Wrapper..."
@@ -288,6 +321,8 @@ func (m Model) View() string {
 	switch m.screen {
 	case screenAdd:
 		body = m.viewAdd()
+	case screenSettings:
+		body = m.viewSettings()
 	default:
 		body = m.viewHome(m.availableBodyHeight())
 	}
@@ -312,7 +347,7 @@ func (m Model) viewHome(bodyHeight int) string {
 	if sessionLine := m.renderSessionLine(); sessionLine != "" {
 		headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(sessionLine))
 	}
-	headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  space select account  r refresh all  q quit"))
+	headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  s settings  space select account  r refresh all  q quit"))
 
 	headerPanel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -358,7 +393,11 @@ func (m Model) renderStatusLine() string {
 	if m.isLoading && !m.hasSnapshot {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Loading account data...")
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically and `r` forces a fresh pass across every stored account.")
+	clearMode := "on"
+	if !m.snapshot.Settings.ClearTerminalBeforeLaunch {
+		clearMode = "off"
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically, `r` forces a fresh pass, and launch screen clearing is " + clearMode + ".")
 }
 
 func (m Model) renderSessionLine() string {
@@ -519,6 +558,36 @@ func (m Model) viewAdd() string {
 		m.idInput.View(),
 		"",
 		muted.Render("Enter confirms and hands off to stock `codex login`. Esc returns home."),
+	}
+	if m.errMessage != "" {
+		body = append(body, "", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Render(m.errMessage))
+	}
+	return panel.Render(strings.Join(body, "\n"))
+}
+
+func (m Model) viewSettings() string {
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0"))
+	enabled := m.snapshot.Settings.ClearTerminalBeforeLaunch
+	value := "On"
+	description := "Clear the terminal before each Codex launch so return/resume cycles do not stack replay output."
+	if !enabled {
+		value = "Off"
+		description = "Keep prior terminal scrollback visible when launching back into Codex."
+	}
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#2A3B47")).
+		Padding(1, 2).
+		Width(max(64, m.width-10))
+
+	body := []string{
+		"Settings",
+		"",
+		fmt.Sprintf("> Clear terminal before launching Codex: %s", value),
+		"",
+		muted.Render(description),
+		"",
+		muted.Render("Enter or Space toggles this setting. Esc returns home."),
 	}
 	if m.errMessage != "" {
 		body = append(body, "", lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Render(m.errMessage))

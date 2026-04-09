@@ -212,6 +212,9 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, sessionID string, cw
 	}, nil); err != nil {
 		return "", err
 	}
+	if spec.Settings.ClearTerminalBeforeLaunch {
+		clearTerminal()
+	}
 	fmt.Println()
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
@@ -239,6 +242,10 @@ func returnHomeMessage(spec ipc.LaunchSpec) string {
 		return fmt.Sprintf("Returned from Codex. Enter resumes thread %s.", *spec.ThreadID)
 	}
 	return "Returned from Codex."
+}
+
+func clearTerminal() {
+	fmt.Print("\x1b[2J\x1b[H")
 }
 
 func ensureClient(paths store.Paths) (*ipc.Client, error) {
