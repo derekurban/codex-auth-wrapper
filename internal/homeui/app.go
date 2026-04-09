@@ -46,6 +46,7 @@ type Model struct {
 	width         int
 	height        int
 	selectedIndex int
+	scrollOffset  int
 	snapshot      ipc.HomeSnapshotResponse
 	statusMessage string
 	errMessage    string
@@ -128,6 +129,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) syncSelection() {
 	if len(m.snapshot.Profiles) == 0 {
 		m.selectedIndex = 0
+		m.scrollOffset = 0
 		return
 	}
 	if m.selectedIndex >= len(m.snapshot.Profiles) || m.selectedIndex < 0 {
@@ -136,9 +138,10 @@ func (m *Model) syncSelection() {
 	for i, profile := range m.snapshot.Profiles {
 		if profile.Selected {
 			m.selectedIndex = i
-			return
+			break
 		}
 	}
+	m.ensureSelectionVisible(m.visibleProfileRows())
 }
 
 func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -161,11 +164,13 @@ func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.selectedIndex > 0 {
 			m.selectedIndex--
 		}
+		m.ensureSelectionVisible(m.visibleProfileRows())
 		return m, nil
 	case "down", "j":
 		if m.selectedIndex < len(m.snapshot.Profiles)-1 {
 			m.selectedIndex++
 		}
+		m.ensureSelectionVisible(m.visibleProfileRows())
 		return m, nil
 	case " ":
 		if len(m.snapshot.Profiles) == 0 {
@@ -282,6 +287,7 @@ func (m Model) View() string {
 }
 
 func (m Model) viewHome() string {
+	contentWidth := m.contentWidth()
 	primary := "Press Enter to set up your first account"
 	if len(m.snapshot.Profiles) > 0 {
 		primary = "Press Enter to continue into Codex"
@@ -291,7 +297,7 @@ func (m Model) viewHome() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#2A3B47")).
 		Padding(1, 2).
-		Width(max(76, m.width-10)).
+		Width(contentWidth).
 		Render(strings.Join([]string{
 			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7BD389")).Render(primary),
 			m.renderStatusLine(),
@@ -303,17 +309,13 @@ func (m Model) viewHome() string {
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#2A3B47")).
 			Padding(1, 2).
-			Width(max(76, m.width-10)).
+			Width(contentWidth).
 			Render("No accounts linked yet.\n\nAdd a profile to import a stock Codex login, then return here to see the email, plan, linked account, and live 5-hour and weekly usage.")
 		return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", emptyPanel)
 	}
 
-	cards := make([]string, 0, len(m.snapshot.Profiles))
-	for i, profile := range m.snapshot.Profiles {
-		cards = append(cards, m.renderProfileCard(i == m.selectedIndex, profile))
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", strings.Join(cards, "\n\n"))
+	listHeight := m.availableListHeight(lipgloss.Height(headerPanel))
+	return lipgloss.JoinVertical(lipgloss.Left, headerPanel, "", m.renderProfilesList(contentWidth, listHeight))
 }
 
 func (m Model) renderStatusLine() string {
@@ -329,39 +331,123 @@ func (m Model) renderStatusLine() string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically and `r` forces a fresh pass across every stored account.")
 }
 
-func (m Model) renderProfileCard(active bool, profile ipc.ProfileSummary) string {
-	borderColor := "#2A3B47"
-	titleColor := "#F4EEE1"
-	if active {
-		borderColor = "#F6AE2D"
-		titleColor = "#F6AE2D"
+func (m *Model) renderProfilesList(width int, listHeight int) string {
+	panelWidth := width
+	rowHeight := 3
+	visibleRows := max(1, (listHeight-2)/rowHeight)
+	m.ensureSelectionVisible(visibleRows)
+
+	start := min(m.scrollOffset, max(0, len(m.snapshot.Profiles)-visibleRows))
+	end := min(len(m.snapshot.Profiles), start+visibleRows)
+	rows := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		rows = append(rows, m.renderProfileRow(i, panelWidth-6, rowHeight))
+	}
+	if len(rows) == 0 {
+		rows = append(rows, "No profiles.")
+	}
+
+	footer := fmt.Sprintf("Showing %d-%d of %d", start+1, end, len(m.snapshot.Profiles))
+	if end == 0 {
+		footer = "Showing 0 of 0"
+	}
+	if len(m.snapshot.Profiles) > visibleRows {
+		footer += "  •  use ↑/↓ to scroll"
+	}
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#2A3B47")).
+		Padding(0, 2).
+		Width(panelWidth).
+		Height(max(5, listHeight))
+
+	return panel.Render(strings.Join([]string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F6AE2D")).Render("Accounts"),
+		strings.Join(rows, "\n"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(footer),
+	}, "\n"))
+}
+
+func (m Model) renderProfileRow(index int, width int, rowHeight int) string {
+	profile := m.snapshot.Profiles[index]
+	cursor := " "
+	nameColor := lipgloss.Color("#F4EEE1")
+	if index == m.selectedIndex {
+		cursor = ">"
+		nameColor = lipgloss.Color("#F6AE2D")
 	}
 
 	title := profile.Name
 	if profile.Selected {
-		title += "  [selected]"
+		title += " [selected]"
 	}
-	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(titleColor)).Render(title)
-	healthLine := fmt.Sprintf("%s  %s", strings.ToUpper(string(profile.Health)), formatPlanAndEmail(profile))
-	accountLine := formatLinkedIdentity(profile)
-	fiveHourLine := formatUsageLine("5-hour", profile.FiveHourUsagePercent, profile.FiveHourResetsAt)
-	weeklyLine := formatUsageLine("Weekly", profile.WeeklyUsagePercent, profile.WeeklyResetsAt)
-	lastChecked := formatLastChecked(profile.LastCheckedAt, profile.LastError)
+	line1Parts := []string{
+		cursor + " " + title,
+		strings.ToUpper(string(profile.Health)),
+	}
+	if planEmail := formatPlanAndEmail(profile); planEmail != "" {
+		line1Parts = append(line1Parts, planEmail)
+	}
+	line2 := compactUsageSegment("5h", profile.FiveHourUsagePercent, profile.FiveHourResetsAt)
+	line3Parts := []string{
+		compactUsageSegment("wk", profile.WeeklyUsagePercent, profile.WeeklyResetsAt),
+		shortRefreshStatus(profile.LastCheckedAt, profile.LastError),
+	}
+	if linked := compactLinkedIdentity(profile); linked != "" {
+		line3Parts = append(line3Parts, linked)
+	}
 
-	card := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(borderColor)).
-		Padding(1, 2).
-		Width(max(76, m.width-10))
+	lines := []string{
+		truncate(joinParts(line1Parts), width),
+		truncate(line2, width),
+		truncate(joinParts(line3Parts), width),
+	}
 
-	return card.Render(strings.Join([]string{
-		header,
-		healthLine,
-		accountLine,
-		fiveHourLine,
-		weeklyLine,
-		lastChecked,
-	}, "\n"))
+	rowStyle := lipgloss.NewStyle()
+	if index == m.selectedIndex {
+		rowStyle = rowStyle.Foreground(nameColor)
+	} else {
+		rowStyle = rowStyle.Foreground(lipgloss.Color("#D9D2C5"))
+	}
+	return rowStyle.Render(strings.Join(lines[:rowHeight], "\n"))
+}
+
+func (m *Model) ensureSelectionVisible(visibleRows int) {
+	if visibleRows <= 0 {
+		visibleRows = 1
+	}
+	if m.selectedIndex < m.scrollOffset {
+		m.scrollOffset = m.selectedIndex
+	}
+	if m.selectedIndex >= m.scrollOffset+visibleRows {
+		m.scrollOffset = m.selectedIndex - visibleRows + 1
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+	maxOffset := max(0, len(m.snapshot.Profiles)-visibleRows)
+	if m.scrollOffset > maxOffset {
+		m.scrollOffset = maxOffset
+	}
+}
+
+func (m Model) visibleProfileRows() int {
+	contentWidth := m.contentWidth()
+	_ = contentWidth
+	headerHeight := 8
+	listHeight := m.availableListHeight(headerHeight)
+	return max(1, (listHeight-2)/3)
+}
+
+func (m Model) availableListHeight(headerHeight int) int {
+	bodyHeight := m.height - 6
+	listHeight := bodyHeight - headerHeight - 1
+	return max(5, listHeight)
+}
+
+func (m Model) contentWidth() int {
+	return max(48, m.width-10)
 }
 
 func (m Model) viewAdd() string {
@@ -403,18 +489,18 @@ func formatPlanAndEmail(profile ipc.ProfileSummary) string {
 	return strings.Join(parts, "  •  ")
 }
 
-func formatLinkedIdentity(profile ipc.ProfileSummary) string {
+func compactLinkedIdentity(profile ipc.ProfileSummary) string {
 	parts := []string{}
 	if profile.LinkedAccountID != "" {
-		parts = append(parts, "Workspace "+shortenID(profile.LinkedAccountID))
+		parts = append(parts, "ws "+shortenID(profile.LinkedAccountID))
 	}
 	if profile.LinkedUserID != "" {
-		parts = append(parts, "User "+shortenID(profile.LinkedUserID))
+		parts = append(parts, "user "+shortenID(profile.LinkedUserID))
 	}
 	if len(parts) == 0 {
-		return "Linked identity: unavailable"
+		return ""
 	}
-	return "Linked identity: " + strings.Join(parts, "  •  ")
+	return strings.Join(parts, "  •  ")
 }
 
 func formatUsageLine(label string, used *int, resetsAt *time.Time) string {
@@ -430,12 +516,44 @@ func formatUsageLine(label string, used *int, resetsAt *time.Time) string {
 
 func formatLastChecked(lastChecked *time.Time, lastError string) string {
 	if lastError != "" {
-		return "Refresh status: " + truncate(lastError, 120)
+		return "Refresh: " + truncate(lastError, 120)
 	}
 	if lastChecked == nil {
-		return "Refresh status: not checked yet"
+		return "Refresh: not checked yet"
 	}
-	return "Refresh status: updated " + time.Since(*lastChecked).Round(time.Second).String() + " ago"
+	return "Refresh: updated " + time.Since(*lastChecked).Round(time.Second).String() + " ago"
+}
+
+func compactUsageSegment(label string, used *int, resetsAt *time.Time) string {
+	if used == nil {
+		return label + " [----------] n/a"
+	}
+	segment := fmt.Sprintf("%s %s %d%%", label, progressBar(*used, 10), *used)
+	if resetsAt != nil {
+		segment += "  " + relativeReset(*resetsAt)
+	}
+	return segment
+}
+
+func shortRefreshStatus(lastChecked *time.Time, lastError string) string {
+	if lastError != "" {
+		return "err"
+	}
+	if lastChecked == nil {
+		return "not checked"
+	}
+	return "upd " + time.Since(*lastChecked).Round(time.Second).String()
+}
+
+func joinParts(parts []string) string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return strings.Join(out, "  •  ")
 }
 
 func relativeReset(ts time.Time) string {
@@ -490,6 +608,23 @@ func truncate(value string, limit int) string {
 	return value[:limit-3] + "..."
 }
 
+func progressBar(percent int, width int) string {
+	if width <= 0 {
+		width = 1
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := (percent*width + 50) / 100
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
+}
+
 func (m Model) refreshCmd(force bool) tea.Cmd {
 	return func() tea.Msg {
 		return loadSnapshot(m.client, m.sessionID, force)
@@ -522,6 +657,13 @@ func loadSnapshot(client *ipc.Client, sessionID string, force bool) snapshotMsg 
 
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b
