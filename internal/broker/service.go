@@ -131,7 +131,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return ipc.Empty{}, s.selectProfile(ctx, req)
+		return ipc.Empty{}, s.selectProfile(ctx, connID, req)
 	case "launch.prepare":
 		var req ipc.PrepareLaunchRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -332,7 +332,7 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 	return nil
 }
 
-func (s *Service) selectProfile(ctx context.Context, req ipc.SelectProfileRequest) error {
+func (s *Service) selectProfile(ctx context.Context, connID string, req ipc.SelectProfileRequest) error {
 	state, err := s.store.LoadState()
 	if err != nil {
 		return err
@@ -354,7 +354,7 @@ func (s *Service) selectProfile(ctx context.Context, req ipc.SelectProfileReques
 	if err := s.activateProfile(ctx, req.ProfileID, "profile_switch"); err != nil {
 		return err
 	}
-	s.broadcastReload(state.CurrentAuthEpochID, state.SelectedProfileID, "profile_switched")
+	s.broadcastReload(connID, state.CurrentAuthEpochID, state.SelectedProfileID, "profile_switched")
 	return nil
 }
 
@@ -892,12 +892,12 @@ func warningState(five *int, weekly *int) model.ProfileWarningState {
 	}
 }
 
-func (s *Service) broadcastReload(authEpochID string, profileID *string, reason string) {
+func (s *Service) broadcastReload(excludeConnID string, authEpochID string, profileID *string, reason string) {
 	s.mu.Lock()
 	server := s.server
 	s.mu.Unlock()
 	if server != nil {
-		server.Broadcast("reload.notice", ipc.ReloadNotice{
+		server.BroadcastExcept(excludeConnID, "reload.notice", ipc.ReloadNotice{
 			AuthEpochID: authEpochID,
 			ProfileID:   profileID,
 			Reason:      reason,

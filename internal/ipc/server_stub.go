@@ -41,3 +41,10 @@ func (s *Server) Broadcast(name string, payload any) {
 	_ = name
 	_ = payload
 }
+
+func (s *Server) BroadcastExcept(excludeConnID string, name string, payload any) {
+	_ = s
+	_ = excludeConnID
+	_ = name
+	_ = payload
+}

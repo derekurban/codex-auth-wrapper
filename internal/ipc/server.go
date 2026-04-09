@@ -96,9 +96,16 @@ func (s *Server) SendEvent(connID, name string, payload any) error {
 }
 
 func (s *Server) Broadcast(name string, payload any) {
+	s.BroadcastExcept("", name, payload)
+}
+
+func (s *Server) BroadcastExcept(excludeConnID string, name string, payload any) {
 	s.connsMu.Lock()
 	ids := make([]string, 0, len(s.conns))
 	for id := range s.conns {
+		if excludeConnID != "" && id == excludeConnID {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	s.connsMu.Unlock()
