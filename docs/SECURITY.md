@@ -17,8 +17,8 @@ Windows PowerShell:
 
 ```powershell
 Invoke-WebRequest https://github.com/derekurban/codex-auth-wrapper/releases/download/vX.Y.Z/checksums.txt -OutFile checksums.txt
-Invoke-WebRequest https://github.com/derekurban/codex-auth-wrapper/releases/download/vX.Y.Z/caw_vX.Y.Z_windows_amd64.zip -OutFile caw.zip
-$expected = (Get-Content checksums.txt | Where-Object { $_ -match "caw_vX.Y.Z_windows_amd64.zip" }).Split()[0]
+Invoke-WebRequest https://github.com/derekurban/codex-auth-wrapper/releases/download/vX.Y.Z/caw_X.Y.Z_windows_amd64.zip -OutFile caw.zip
+$expected = (Get-Content checksums.txt | Where-Object { $_ -match "caw_X.Y.Z_windows_amd64.zip" }).Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 caw.zip).Hash.ToLowerInvariant()
 if ($expected.ToLowerInvariant() -ne $actual) { throw "Checksum mismatch" }
 ```

@@ -1,10 +1,11 @@
-$ErrorActionPreference = "Stop"
-
 param(
   [string]$Version = $env:VERSION,
   [string]$InstallDir = $(if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $env:USERPROFILE "bin" }),
+  [string]$CacheDir = $(if ($env:CAW_CACHE_DIR) { $env:CAW_CACHE_DIR } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "codex-auth-wrapper\\cache" } else { Join-Path ([System.IO.Path]::GetTempPath()) "codex-auth-wrapper-cache" }),
   [switch]$NoCheck
 )
+
+$ErrorActionPreference = "Stop"
 
 $Repo = "derekurban/codex-auth-wrapper"
 $Binary = "caw"
@@ -30,20 +31,48 @@ function Resolve-Arch {
   }
 }
 
+function Download-IfMissing {
+  param(
+    [string]$Uri,
+    [string]$OutFile
+  )
+
+  if (-not (Test-Path $OutFile)) {
+    Write-Host "Downloading $(Split-Path -Leaf $OutFile)..."
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile
+    return
+  }
+  Write-Host "Using cached $(Split-Path -Leaf $OutFile)..."
+}
+
+function Download-Force {
+  param(
+    [string]$Uri,
+    [string]$OutFile
+  )
+
+  Write-Host "Re-downloading $(Split-Path -Leaf $OutFile)..."
+  Invoke-WebRequest -Uri $Uri -OutFile $OutFile
+}
+
 $ResolvedVersion = Resolve-Version -RequestedVersion $Version
+$AssetVersion = $ResolvedVersion -replace '^v', ''
 $Arch = Resolve-Arch
-$AssetName = "${Binary}_${ResolvedVersion}_windows_${Arch}.zip"
+$AssetName = "${Binary}_${AssetVersion}_windows_${Arch}.zip"
 $ReleaseBase = "https://github.com/$Repo/releases/download/$ResolvedVersion"
+$VersionCacheDir = Join-Path $CacheDir $ResolvedVersion
 
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $TempDir | Out-Null
 
 try {
-  $ArchivePath = Join-Path $TempDir $AssetName
-  $ChecksumsPath = Join-Path $TempDir "checksums.txt"
+  New-Item -ItemType Directory -Force -Path $VersionCacheDir | Out-Null
+  $ArchivePath = Join-Path $VersionCacheDir $AssetName
+  $ChecksumsPath = Join-Path $VersionCacheDir "checksums.txt"
+  $ExtractDir = Join-Path $TempDir "extract"
 
-  Invoke-WebRequest -Uri "$ReleaseBase/$AssetName" -OutFile $ArchivePath
-  Invoke-WebRequest -Uri "$ReleaseBase/checksums.txt" -OutFile $ChecksumsPath
+  Download-IfMissing -Uri "$ReleaseBase/checksums.txt" -OutFile $ChecksumsPath
+  Download-IfMissing -Uri "$ReleaseBase/$AssetName" -OutFile $ArchivePath
 
   $ExpectedHash = (
     Get-Content $ChecksumsPath |
@@ -57,13 +86,18 @@ try {
 
   $ActualHash = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLowerInvariant()
   if ($ActualHash -ne $ExpectedHash.ToLowerInvariant()) {
-    throw "Checksum mismatch for $AssetName"
+    Remove-Item -Force $ArchivePath -ErrorAction SilentlyContinue
+    Download-Force -Uri "$ReleaseBase/$AssetName" -OutFile $ArchivePath
+    $ActualHash = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLowerInvariant()
+    if ($ActualHash -ne $ExpectedHash.ToLowerInvariant()) {
+      throw "Checksum mismatch for $AssetName"
+    }
   }
 
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-  Expand-Archive -Path $ArchivePath -DestinationPath $TempDir -Force
+  Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
 
-  $BinaryPath = Get-ChildItem -Path $TempDir -Recurse -Filter "$Binary.exe" | Select-Object -First 1
+  $BinaryPath = Get-ChildItem -Path $ExtractDir -Recurse -Filter "$Binary.exe" | Select-Object -First 1
   if (-not $BinaryPath) {
     throw "Extracted archive did not contain $Binary.exe"
   }
@@ -71,6 +105,7 @@ try {
   $Destination = Join-Path $InstallDir "$Binary.exe"
   Copy-Item -Path $BinaryPath.FullName -Destination $Destination -Force
   Write-Host "Installed $Binary $ResolvedVersion to $Destination"
+  Write-Host "Using release cache at $VersionCacheDir"
 
   if (-not $NoCheck) {
     & $Destination --version
