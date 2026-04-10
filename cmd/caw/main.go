@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,8 +13,8 @@ import (
 	"github.com/derekurban/codex-auth-wrapper/internal/broker"
 	"github.com/derekurban/codex-auth-wrapper/internal/codex"
 	"github.com/derekurban/codex-auth-wrapper/internal/homeui"
+	"github.com/derekurban/codex-auth-wrapper/internal/host"
 	"github.com/derekurban/codex-auth-wrapper/internal/ipc"
-	"github.com/derekurban/codex-auth-wrapper/internal/model"
 	"github.com/derekurban/codex-auth-wrapper/internal/store"
 )
 
@@ -26,53 +23,6 @@ var (
 	commit  = "none"
 	date    = "unknown"
 )
-
-type hostSignals struct {
-	mu           sync.Mutex
-	reload       *ipc.ReloadNotice
-	switchNotice *ipc.SwitchNotice
-}
-
-func (s *hostSignals) setReload(notice ipc.ReloadNotice) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	copy := notice
-	s.reload = &copy
-}
-
-func (s *hostSignals) takeHomeEvent() *homeui.ExternalEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.switchNotice != nil {
-		event := &homeui.ExternalEvent{Switch: s.switchNotice}
-		s.switchNotice = nil
-		return event
-	}
-	if s.reload == nil {
-		return nil
-	}
-	event := &homeui.ExternalEvent{Reload: s.reload}
-	s.reload = nil
-	return event
-}
-
-func (s *hostSignals) takeReload() *ipc.ReloadNotice {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.reload == nil {
-		return nil
-	}
-	notice := s.reload
-	s.reload = nil
-	return notice
-}
-
-func (s *hostSignals) setSwitchNotice(notice ipc.SwitchNotice) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	copy := notice
-	s.switchNotice = &copy
-}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -166,23 +116,8 @@ func unregisterSession(client *ipc.Client, sessionID string) {
 }
 
 func runHost(paths store.Paths) error {
-	signals := &hostSignals{}
-	client, err := ensureClient(paths, func(name string, payload json.RawMessage) {
-		switch name {
-		case "reload.notice":
-			var notice ipc.ReloadNotice
-			if err := json.Unmarshal(payload, &notice); err != nil {
-				return
-			}
-			signals.setReload(notice)
-		case "switch.notice":
-			var notice ipc.SwitchNotice
-			if err := json.Unmarshal(payload, &notice); err != nil {
-				return
-			}
-			signals.setSwitchNotice(notice)
-		}
-	})
+	signals := &host.SignalBuffer{}
+	client, err := ensureClient(paths, signals.HandleEvent)
 	if err != nil {
 		return err
 	}
@@ -203,9 +138,11 @@ func runHost(paths store.Paths) error {
 	}
 	defer unregisterSession(client, sessionID)
 
+	hostRuntime := host.NewSessionRuntime(client, paths, signals, sessionID, cwd, clearTerminal)
+
 	statusMessage := ""
 	for {
-		action, err := homeui.Run(client, signals.takeHomeEvent, sessionID, statusMessage)
+		action, err := homeui.Run(client, signals.TakeHomeEvent, sessionID, statusMessage)
 		if err != nil {
 			return err
 		}
@@ -220,7 +157,7 @@ func runHost(paths store.Paths) error {
 				statusMessage = message
 			}
 		case homeui.ActionContinue:
-			message, err := launchCodexFlow(client, paths, signals, sessionID, cwd)
+			message, err := hostRuntime.EnterCodex()
 			if err != nil {
 				statusMessage = "Codex launch failed: " + err.Error()
 			} else {
@@ -259,126 +196,6 @@ func addProfileFlow(client *ipc.Client, action homeui.Action) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Linked account %q.", action.ProfileName), nil
-}
-
-func launchCodexFlow(client *ipc.Client, paths store.Paths, signals *hostSignals, sessionID string, cwd string) (string, error) {
-	var reloadNotice *ipc.ReloadNotice
-launchLoop:
-	for {
-		reloadMessage := ""
-		if reloadNotice != nil {
-			reloadMessage = reloadNotice.Message
-			reloadNotice = nil
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		var spec ipc.LaunchSpec
-		err := client.Request(ctx, "launch.prepare", ipc.PrepareLaunchRequest{
-			SessionID: sessionID,
-			Cwd:       cwd,
-		}, &spec)
-		cancel()
-		if err != nil {
-			return "", err
-		}
-		if err := client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
-			SessionID: sessionID,
-			State:     model.SessionStateInCodex,
-		}, nil); err != nil {
-			return "", err
-		}
-		if spec.Settings.ClearTerminalBeforeLaunch {
-			clearTerminal()
-		}
-		fmt.Println()
-		if reloadMessage != "" {
-			fmt.Println(reloadMessage)
-			fmt.Println()
-		}
-		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
-			fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
-		} else {
-			fmt.Println("Launching stock Codex connected to the shared wrapper-managed app-server.")
-		}
-		fmt.Println("Exit Codex normally to return to the wrapper home. F12 interception is not wired yet in this build.")
-		fmt.Println()
-
-		cmd, err := codex.StartRemote(spec, paths.CodexHome)
-		if err != nil {
-			return "", err
-		}
-		waitCh := make(chan error, 1)
-		go func() {
-			waitCh <- cmd.Wait()
-		}()
-
-		for {
-			select {
-			case err := <-waitCh:
-				if nextReload, reload := reloadAfterExit(client, spec, reloadNotice); reload {
-					reloadNotice = nextReload
-					continue launchLoop
-				}
-				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
-				homeCancel()
-				if err != nil {
-					var exitErr *exec.ExitError
-					if errors.As(err, &exitErr) {
-						return returnHomeMessage(spec, false), nil
-					}
-					return "", err
-				}
-				return returnHomeMessage(spec, false), nil
-			default:
-				if notice := signals.takeReload(); notice != nil && isNewerAuthEpoch(notice.AuthEpochID, spec.AuthEpochID) {
-					reloadNotice = notice
-					_ = client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
-						SessionID: sessionID,
-						State:     model.SessionStateReloading,
-					}, nil)
-				}
-				time.Sleep(150 * time.Millisecond)
-			}
-		}
-	}
-}
-
-func reloadAfterExit(client *ipc.Client, spec ipc.LaunchSpec, current *ipc.ReloadNotice) (*ipc.ReloadNotice, bool) {
-	if current != nil && isNewerAuthEpoch(current.AuthEpochID, spec.AuthEpochID) {
-		return current, true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	var snapshot ipc.StatusSnapshot
-	if err := client.Request(ctx, "status.snapshot", ipc.Empty{}, &snapshot); err != nil {
-		return nil, false
-	}
-	if isNewerAuthEpoch(snapshot.ActiveAuthEpochID, spec.AuthEpochID) {
-		return &ipc.ReloadNotice{
-			AuthEpochID: snapshot.ActiveAuthEpochID,
-			ProfileID:   snapshot.ActiveProfileID,
-			Reason:      "profile_switched",
-			Message:     "Account switched. Reloading this Codex session onto the new account.",
-		}, true
-	}
-	return nil, false
-}
-
-func returnHomeMessage(spec ipc.LaunchSpec, pendingReload bool) string {
-	if pendingReload {
-		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
-			return fmt.Sprintf("Account switched in another CAW window while you were working. This Home session is now on the active profile. Enter will resume thread %s on the new account.", *spec.ThreadID)
-		}
-		return "Account switched in another CAW window while you were working. This Home session is now on the active profile."
-	}
-	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
-		return fmt.Sprintf("Returned from Codex. Enter resumes thread %s.", *spec.ThreadID)
-	}
-	return "Returned from Codex."
-}
-
-func isNewerAuthEpoch(candidate string, current string) bool {
-	return candidate > current
 }
 
 func clearTerminal() {

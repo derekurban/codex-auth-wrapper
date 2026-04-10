@@ -1,10 +1,13 @@
-package broker
+package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -14,13 +17,32 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type gatewayServer struct {
-	httpServer *http.Server
-	listener   net.Listener
-	listenURL  string
+type BackendResolver func(sessionID string) (backendURL string, backendToken string, ok bool)
+type CwdResolver func(sessionID string) (string, bool)
+
+type Observer interface {
+	OnGatewayConnected(ctx context.Context, sessionID string, connected bool) error
+	OnThreadObserved(sessionID, threadID, cwd string) error
+	OnTurnStarted(ctx context.Context, sessionID string) error
+	OnTurnCompleted(ctx context.Context, sessionID string) error
+	OnThreadStatus(ctx context.Context, sessionID string, status string) error
 }
 
-type gatewayConnState struct {
+// Server owns the thin websocket proxy in front of the shared Codex app-server.
+// It is intentionally limited to auth, request rewriting, and observation.
+type Server struct {
+	backendResolver BackendResolver
+	cwdResolver     CwdResolver
+	observer        Observer
+
+	mu            sync.Mutex
+	httpServer    *http.Server
+	listener      net.Listener
+	listenURL     string
+	sessionTokens map[string]string
+}
+
+type connState struct {
 	mu      sync.Mutex
 	pending map[string]pendingThreadRequest
 }
@@ -36,16 +58,25 @@ type trackedThread struct {
 	Cwd string
 }
 
-type gatewayObservation struct {
+type observation struct {
 	Thread       *trackedThread
 	TurnStarted  bool
 	TurnComplete bool
 	ThreadStatus string
 }
 
-func (s *Service) startGateway(ctx context.Context) error {
+func New(backendResolver BackendResolver, cwdResolver CwdResolver, observer Observer) *Server {
+	return &Server{
+		backendResolver: backendResolver,
+		cwdResolver:     cwdResolver,
+		observer:        observer,
+		sessionTokens:   map[string]string{},
+	}
+}
+
+func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
-	if s.gateway != nil {
+	if s.httpServer != nil {
 		s.mu.Unlock()
 		return nil
 	}
@@ -55,62 +86,90 @@ func (s *Service) startGateway(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	gatewayURL := fmt.Sprintf("ws://%s", listener.Addr().String())
-
+	listenURL := fmt.Sprintf("ws://%s", listener.Addr().String())
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleGatewayWebSocket)
-	httpServer := &http.Server{
+	mux.HandleFunc("/", s.handleWebSocket)
+	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	s.mu.Lock()
-	s.gatewayURL = gatewayURL
-	s.gateway = &gatewayServer{
-		httpServer: httpServer,
-		listener:   listener,
-		listenURL:  gatewayURL,
-	}
+	s.listener = listener
+	s.httpServer = server
+	s.listenURL = listenURL
 	s.mu.Unlock()
 
 	go func() {
 		<-ctx.Done()
-		s.shutdownGateway()
+		s.Close()
 	}()
-
 	go func() {
-		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.setDegraded(fmt.Errorf("gateway serve failed: %w", err))
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			_ = err
 		}
 	}()
-
 	return nil
 }
 
-func (s *Service) shutdownGateway() {
+func (s *Server) Close() {
 	s.mu.Lock()
-	gateway := s.gateway
-	s.gateway = nil
-	s.gatewayURL = ""
+	server := s.httpServer
+	listener := s.listener
+	s.httpServer = nil
+	s.listener = nil
+	s.listenURL = ""
 	s.sessionTokens = map[string]string{}
 	s.mu.Unlock()
-	if gateway != nil {
+	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = gateway.httpServer.Shutdown(ctx)
-		_ = gateway.listener.Close()
+		_ = server.Shutdown(ctx)
+	}
+	if listener != nil {
+		_ = listener.Close()
 	}
 }
 
-func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) {
-	sessionID, backendURL, backendToken, ok := s.gatewayAuthContext(r)
+func (s *Server) URL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listenURL
+}
+
+func (s *Server) IssueSessionToken(sessionID string) (string, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for existingToken, existingSessionID := range s.sessionTokens {
+		if existingSessionID == sessionID {
+			delete(s.sessionTokens, existingToken)
+		}
+	}
+	s.sessionTokens[token] = sessionID
+	return token, nil
+}
+
+func (s *Server) RevokeSessionTokens(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for token, existingSessionID := range s.sessionTokens {
+		if existingSessionID == sessionID {
+			delete(s.sessionTokens, token)
+		}
+	}
+}
+
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	sessionID, backendURL, backendToken, ok := s.authContext(r)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -130,17 +189,15 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 	}
 	defer backendConn.Close()
 
-	state := &gatewayConnState{pending: map[string]pendingThreadRequest{}}
-	errCh := make(chan error, 2)
-	if err := s.setGatewayConnected(context.Background(), sessionID, true); err != nil {
-		s.setDegraded(err)
+	state := &connState{pending: map[string]pendingThreadRequest{}}
+	if s.observer != nil {
+		_ = s.observer.OnGatewayConnected(context.Background(), sessionID, true)
+		defer func() {
+			_ = s.observer.OnGatewayConnected(context.Background(), sessionID, false)
+		}()
 	}
-	defer func() {
-		if err := s.setGatewayConnected(context.Background(), sessionID, false); err != nil {
-			s.setDegraded(err)
-		}
-	}()
 
+	errCh := make(chan error, 2)
 	go func() {
 		errCh <- proxyFrames(clientConn, backendConn, func(data []byte) []byte {
 			return s.rewriteClientMessage(sessionID, data)
@@ -150,77 +207,51 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 	}()
 	go func() {
 		errCh <- proxyFrames(backendConn, clientConn, nil, func(data []byte) {
-			// Gateway notifications are the broker's live truth for whether a
-			// Codex session is busy. We cannot infer safe global auth switching
-			// from terminal output or persisted rollout files reliably.
 			observation := state.trackServerMessage(data)
+			if s.observer == nil {
+				return
+			}
 			if observation.Thread != nil {
-				if err := s.updateSessionActiveThread(sessionID, *observation.Thread); err != nil {
-					s.setDegraded(err)
-				}
+				_ = s.observer.OnThreadObserved(sessionID, observation.Thread.ID, observation.Thread.Cwd)
 			}
 			if observation.TurnStarted {
-				if err := s.noteTurnStarted(context.Background(), sessionID); err != nil {
-					s.setDegraded(err)
-				}
+				_ = s.observer.OnTurnStarted(context.Background(), sessionID)
 			}
 			if observation.TurnComplete {
-				if err := s.noteTurnCompleted(context.Background(), sessionID); err != nil {
-					s.setDegraded(err)
-				}
+				_ = s.observer.OnTurnCompleted(context.Background(), sessionID)
 			}
 			if observation.ThreadStatus != "" {
-				if err := s.noteThreadStatus(context.Background(), sessionID, observation.ThreadStatus); err != nil {
-					s.setDegraded(err)
-				}
+				_ = s.observer.OnThreadStatus(context.Background(), sessionID, observation.ThreadStatus)
 			}
 		})
 	}()
-
 	<-errCh
 }
 
-func proxyFrames(src *websocket.Conn, dst *websocket.Conn, rewrite func([]byte) []byte, inspect func([]byte)) error {
-	for {
-		messageType, data, err := src.ReadMessage()
-		if err != nil {
-			return err
-		}
-		if messageType == websocket.TextMessage {
-			if rewrite != nil {
-				data = rewrite(data)
-			}
-			if inspect != nil {
-				inspect(data)
-			}
-		}
-		if err := dst.WriteMessage(messageType, data); err != nil {
-			return err
-		}
-	}
-}
-
-func (s *Service) gatewayAuthContext(r *http.Request) (string, string, string, bool) {
+func (s *Server) authContext(r *http.Request) (string, string, string, bool) {
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
 		return "", "", "", false
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	sessionID, ok := s.sessionTokens[token]
-	if !ok || s.appServerURL == "" || s.appServerToken == "" {
+	s.mu.Unlock()
+	if !ok {
 		return "", "", "", false
 	}
-	return sessionID, s.appServerURL, s.appServerToken, true
+	backendURL, backendToken, ok := s.backendResolver(sessionID)
+	if !ok {
+		return "", "", "", false
+	}
+	return sessionID, backendURL, backendToken, true
 }
 
-func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
-	cwd, ok := s.threadListFilterCwd(sessionID)
+func (s *Server) rewriteClientMessage(sessionID string, data []byte) []byte {
+	cwd, ok := s.cwdResolver(sessionID)
 	if !ok {
 		return data
 	}
-
 	var msg map[string]any
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return data
@@ -256,54 +287,27 @@ func (s *Service) rewriteClientMessage(sessionID string, data []byte) []byte {
 	return rewritten
 }
 
-func (s *Service) threadListFilterCwd(sessionID string) (string, bool) {
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
-		return "", false
+func proxyFrames(src *websocket.Conn, dst *websocket.Conn, rewrite func([]byte) []byte, inspect func([]byte)) error {
+	for {
+		messageType, data, err := src.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if messageType == websocket.TextMessage {
+			if rewrite != nil {
+				data = rewrite(data)
+			}
+			if inspect != nil {
+				inspect(data)
+			}
+		}
+		if err := dst.WriteMessage(messageType, data); err != nil {
+			return err
+		}
 	}
-	record, ok := sessions.Sessions[sessionID]
-	if !ok {
-		return "", false
-	}
-	if record.ActiveThreadCwd != nil && *record.ActiveThreadCwd != "" {
-		return *record.ActiveThreadCwd, true
-	}
-	if record.Cwd != "" {
-		return record.Cwd, true
-	}
-	return "", false
 }
 
-func (s *Service) updateSessionActiveThread(sessionID string, thread trackedThread) error {
-	if thread.ID == "" {
-		return nil
-	}
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
-		return err
-	}
-	record, ok := sessions.Sessions[sessionID]
-	if !ok {
-		return nil
-	}
-	previousThreadID := ""
-	if record.ActiveThreadID != nil {
-		previousThreadID = *record.ActiveThreadID
-	}
-	record.ActiveThreadID = &thread.ID
-	if thread.Cwd != "" {
-		record.ActiveThreadCwd = &thread.Cwd
-	} else if previousThreadID != thread.ID {
-		record.ActiveThreadCwd = nil
-	}
-	record.ResumeAllowed = true
-	record.UpdatedAt = time.Now()
-	sessions.Sessions[sessionID] = record
-	sessions.UpdatedAt = record.UpdatedAt
-	return s.store.SaveSessions(sessions)
-}
-
-func (s *gatewayConnState) trackClientMessage(data []byte) {
+func (s *connState) trackClientMessage(data []byte) {
 	var msg struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
@@ -326,16 +330,12 @@ func (s *gatewayConnState) trackClientMessage(data []byte) {
 		return
 	}
 	s.mu.Lock()
-	s.pending[key] = pendingThreadRequest{
-		Method:   msg.Method,
-		ThreadID: msg.Params.ThreadID,
-		Cwd:      msg.Params.Cwd,
-	}
+	s.pending[key] = pendingThreadRequest{Method: msg.Method, ThreadID: msg.Params.ThreadID, Cwd: msg.Params.Cwd}
 	s.mu.Unlock()
 }
 
-func (s *gatewayConnState) trackServerMessage(data []byte) gatewayObservation {
-	observation := gatewayObservation{}
+func (s *connState) trackServerMessage(data []byte) observation {
+	observation := observation{}
 	if thread, ok := trackThreadStartedNotification(data); ok {
 		observation.Thread = &thread
 	}
@@ -354,7 +354,7 @@ func (s *gatewayConnState) trackServerMessage(data []byte) gatewayObservation {
 	return observation
 }
 
-func (s *gatewayConnState) trackResponse(data []byte) (trackedThread, bool) {
+func (s *connState) trackResponse(data []byte) (trackedThread, bool) {
 	var msg struct {
 		ID     json.RawMessage `json:"id"`
 		Result struct {
@@ -384,10 +384,7 @@ func (s *gatewayConnState) trackResponse(data []byte) (trackedThread, bool) {
 	if !ok || req.Method == "" || msg.Error != nil {
 		return trackedThread{}, false
 	}
-	thread := trackedThread{
-		ID:  msg.Result.Thread.ID,
-		Cwd: msg.Result.Thread.Cwd,
-	}
+	thread := trackedThread{ID: msg.Result.Thread.ID, Cwd: msg.Result.Thread.Cwd}
 	if thread.ID == "" {
 		thread.ID = req.ThreadID
 	}
@@ -408,9 +405,6 @@ func trackThreadStartedNotification(data []byte) (trackedThread, bool) {
 				ID  string `json:"id"`
 				Cwd string `json:"cwd"`
 			} `json:"thread"`
-			Status struct {
-				Type string `json:"type"`
-			} `json:"status"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -460,4 +454,12 @@ func responseIDKey(raw json.RawMessage) string {
 		return ""
 	}
 	return fmt.Sprint(anyID)
+}
+
+func randomToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }

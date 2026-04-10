@@ -2,21 +2,15 @@ package broker
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sync"
 	"time"
 
+	gatewaypkg "github.com/derekurban/codex-auth-wrapper/internal/broker/gateway"
+	runtimepkg "github.com/derekurban/codex-auth-wrapper/internal/broker/runtime"
+	sessionspkg "github.com/derekurban/codex-auth-wrapper/internal/broker/sessions"
+	switchflowpkg "github.com/derekurban/codex-auth-wrapper/internal/broker/switchflow"
 	"github.com/derekurban/codex-auth-wrapper/internal/codex"
 	"github.com/derekurban/codex-auth-wrapper/internal/ipc"
 	"github.com/derekurban/codex-auth-wrapper/internal/model"
@@ -33,34 +27,36 @@ const (
 	maxProfileRefreshJobs  = 3
 )
 
+// Service is the broker composition root. It exposes the existing IPC surface
+// while delegating session ownership, runtime control, and profile-switch
+// decisions to dedicated bounded-context components.
 type Service struct {
 	paths store.Paths
 	store *store.Store
 
-	mu             sync.Mutex
-	switchMu       sync.Mutex
-	refreshRunMu   sync.Mutex
-	server         *ipc.Server
-	gateway        *gatewayServer
-	appServerCmd   *exec.Cmd
-	appServerURL   string
-	appServerToken string
-	gatewayURL     string
-	sessionTokens  map[string]string
-	connSessions   map[string]string
-	sessionRuntime map[string]*sessionRuntime
-	control        *codex.AppServerClient
+	server   *ipc.Server
+	gateway  *gatewaypkg.Server
+	runtime  *runtimepkg.Controller
+	sessions *sessionspkg.Manager
+	switches *switchflowpkg.Coordinator
+
+	switchMu     chan struct{}
+	refreshRunMu chan struct{}
+
 	degradedReason string
 	refreshing     bool
 }
 
 func New(paths store.Paths) *Service {
+	st := store.New(paths)
 	return &Service{
-		paths:          paths,
-		store:          store.New(paths),
-		sessionTokens:  map[string]string{},
-		connSessions:   map[string]string{},
-		sessionRuntime: map[string]*sessionRuntime{},
+		paths:        paths,
+		store:        st,
+		runtime:      runtimepkg.New(paths, st),
+		sessions:     sessionspkg.New(st),
+		switches:     switchflowpkg.New(),
+		switchMu:     make(chan struct{}, 1),
+		refreshRunMu: make(chan struct{}, 1),
 	}
 }
 
@@ -69,7 +65,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.store.EnsureLayout(now); err != nil {
 		return err
 	}
-	if err := s.reconcileStartup(ctx); err != nil {
+	if err := s.reconcileStartup(ctx, now); err != nil {
 		s.setDegraded(err)
 	}
 	if err := s.startGateway(ctx); err != nil {
@@ -77,43 +73,35 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	srv, err := ipc.Listen(s.handleIPC)
 	if err != nil {
-		s.shutdownGateway()
+		s.gateway.Close()
+		s.runtime.Shutdown()
 		return err
 	}
-	s.mu.Lock()
 	s.server = srv
-	s.mu.Unlock()
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
-		s.shutdownGateway()
-		s.shutdownAppServer()
+		s.gateway.Close()
+		s.runtime.Shutdown()
 	}()
 	return srv.Serve(ctx)
 }
 
-func (s *Service) reconcileStartup(ctx context.Context) error {
-	state, err := s.store.LoadState()
-	if err != nil {
+func (s *Service) reconcileStartup(ctx context.Context, now time.Time) error {
+	if err := s.sessions.Reset(now); err != nil {
 		return err
 	}
 	brokerState, err := s.store.LoadBroker()
 	if err != nil {
 		return err
 	}
-	if state.SelectedProfileID == nil {
-		brokerState.BrokerState = model.BrokerStateHomeReady
-		brokerState.ActiveProfileID = nil
-		brokerState.Server.State = model.ServerStateStopped
-		brokerState.UpdatedAt = time.Now()
-		return s.store.SaveBroker(brokerState)
+	cleared := s.switches.ClearStaleOnStartup(now, brokerState)
+	if cleared != brokerState {
+		if err := s.store.SaveBroker(cleared); err != nil {
+			return err
+		}
 	}
-	if brokerState.SwitchContext.InProgress && brokerState.SwitchContext.ToProfileID != nil {
-		s.switchMu.Lock()
-		defer s.switchMu.Unlock()
-		return s.commitProfileSwitch(ctx, *brokerState.SwitchContext.ToProfileID, false, "startup_pending_switch")
-	}
-	return s.activateProfile(ctx, *state.SelectedProfileID, "startup")
+	return s.runtime.ReconcileStartup(ctx)
 }
 
 func (s *Service) handleIPC(ctx context.Context, connID string, method string, payload json.RawMessage) (any, error) {
@@ -125,7 +113,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return ipc.Empty{}, s.registerSession(connID, req)
+		return ipc.Empty{}, s.sessions.RegisterHost(req.SessionID, connID, req.Cwd, time.Now())
 	case "home.snapshot":
 		var req ipc.HomeSnapshotRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -149,13 +137,13 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return s.forcePendingSwitch(ctx, req)
+		return s.forcePendingSwitch(ctx, connID, req)
 	case "profile.switch.cancel":
 		var req ipc.CancelPendingSwitchRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return s.cancelPendingSwitch(req)
+		return s.cancelPendingSwitch(connID, req)
 	case "launch.prepare":
 		var req ipc.PrepareLaunchRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -197,13 +185,10 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 	case "broker.stop":
 		go func() {
 			time.Sleep(50 * time.Millisecond)
-			s.shutdownGateway()
-			s.shutdownAppServer()
-			s.mu.Lock()
-			server := s.server
-			s.mu.Unlock()
-			if server != nil {
-				_ = server.Close()
+			s.gateway.Close()
+			s.runtime.Shutdown()
+			if s.server != nil {
+				_ = s.server.Close()
 			}
 		}()
 		return ipc.Empty{}, nil
@@ -212,36 +197,31 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 	}
 }
 
-func (s *Service) registerSession(connID string, req ipc.RegisterSessionRequest) error {
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
-		return err
+func (s *Service) startGateway(ctx context.Context) error {
+	if s.gateway != nil {
+		return nil
 	}
-	now := time.Now()
-	record, ok := sessions.Sessions[req.SessionID]
+	s.gateway = gatewaypkg.New(s.gatewayBackend, s.sessions.SessionThreadFilterCwd, s)
+	return s.gateway.Start(ctx)
+}
+
+func (s *Service) gatewayBackend(sessionID string) (string, string, bool) {
+	backendURL, backendToken, ok := s.runtime.Backend()
 	if !ok {
-		record = model.SessionRecord{
-			SessionID:     req.SessionID,
-			State:         model.SessionStateHome,
-			Cwd:           req.Cwd,
-			ResumeAllowed: true,
-			CreatedAt:     now,
-			UpdatedAt:     now,
-		}
-	} else {
-		record.Cwd = req.Cwd
-		record.UpdatedAt = now
+		return "", "", false
 	}
-	sessions.Sessions[req.SessionID] = record
-	sessions.UpdatedAt = now
-	if err := s.store.SaveSessions(sessions); err != nil {
-		return err
+	if sessionID == "" {
+		return "", "", false
 	}
-	// Host IPC connections are the broker's source of truth for whether a CAW
-	// window is still alive. Pending global switches should not wait on windows
-	// that have already disconnected.
-	s.bindHostConnection(req.SessionID, connID)
-	return nil
+	return backendURL, backendToken, true
+}
+
+func (s *Service) handleConnectionClosed(ctx context.Context, connID string) error {
+	sessionID := s.sessions.HandleHostDisconnect(connID)
+	if sessionID == "" {
+		return nil
+	}
+	return s.reconcilePendingSwitch(ctx, "", "host_disconnected")
 }
 
 func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest) (ipc.HomeSnapshotResponse, error) {
@@ -257,10 +237,6 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 		return ipc.HomeSnapshotResponse{}, err
 	}
 	brokerState, err := s.store.LoadBroker()
-	if err != nil {
-		return ipc.HomeSnapshotResponse{}, err
-	}
-	sessions, err := s.store.LoadSessions()
 	if err != nil {
 		return ipc.HomeSnapshotResponse{}, err
 	}
@@ -295,19 +271,21 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 			PendingTarget:        pendingTargetID != "" && pendingTargetID == profile.ID,
 		})
 	}
+	session, err := s.sessions.Session(req.SessionID)
+	if err != nil {
+		return ipc.HomeSnapshotResponse{}, err
+	}
 	resp := ipc.HomeSnapshotResponse{
 		SelectedProfileID: state.SelectedProfileID,
 		Profiles:          summaries,
+		Session:           session,
 		Settings: ipc.WrapperSettings{
 			ClearTerminalBeforeLaunch: state.Settings.ClearTerminalEnabled(),
 		},
 		BrokerState:       brokerState.BrokerState,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
 		PendingSwitch:     s.pendingSwitchSummary(&brokerState, req.SessionID),
-		RefreshInProgress: s.refreshInProgress(),
-	}
-	if session, ok := sessions.Sessions[req.SessionID]; ok {
-		resp.Session = &session
+		RefreshInProgress: s.refreshing,
 	}
 	if s.degradedReason != "" {
 		reason := s.degradedReason
@@ -356,7 +334,7 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 		return err
 	}
 	if state.SelectedProfileID != nil && *state.SelectedProfileID == req.ID {
-		if err := s.activateProfile(context.Background(), req.ID, "first_profile_added"); err != nil {
+		if err := s.runtime.EnsureActiveProfile(context.Background(), req.ID, "first_profile_added"); err != nil {
 			return err
 		}
 	}
@@ -365,6 +343,129 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 	if err := s.refreshProfileStatus(refreshCtx, req.ID); err != nil {
 		s.setDegraded(err)
 		return err
+	}
+	return nil
+}
+
+func (s *Service) selectProfile(ctx context.Context, connID string, req ipc.SelectProfileRequest) (ipc.SelectProfileResponse, error) {
+	s.lockSwitch()
+	defer s.unlockSwitch()
+	state, err := s.store.LoadState()
+	if err != nil {
+		return ipc.SelectProfileResponse{}, err
+	}
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return ipc.SelectProfileResponse{}, err
+	}
+	readiness, err := s.sessions.Readiness()
+	if err != nil {
+		return ipc.SelectProfileResponse{}, err
+	}
+	decision, err := s.switches.RequestSwitch(time.Now(), state, brokerState, req.SessionID, req.ProfileID, switchflowpkg.Readiness(readiness), s.store.ProfileExists(req.ProfileID))
+	if err != nil {
+		return ipc.SelectProfileResponse{}, err
+	}
+	if decision.CommitProfileID != nil {
+		if _, err := s.runtime.CommitProfileSwitch(ctx, *decision.CommitProfileID, false, "profile_switched"); err != nil {
+			return ipc.SelectProfileResponse{}, err
+		}
+		state, _ = s.store.LoadState()
+		s.broadcastSwitchNotice(connID, "committed", "Account switched. Live Codex sessions are reloading onto the new account.", nil)
+		s.broadcastReload(state.CurrentAuthEpochID, state.SelectedProfileID, "profile_switched", false, "Account switched. Live Codex sessions are reloading onto the new account.")
+		return ipc.SelectProfileResponse{
+			Outcome:         decision.Outcome,
+			ActiveProfileID: state.SelectedProfileID,
+		}, nil
+	}
+	if err := s.store.SaveBroker(decision.Broker); err != nil {
+		return ipc.SelectProfileResponse{}, err
+	}
+	summary := s.pendingSwitchSummary(&decision.Broker, req.SessionID)
+	switch decision.Outcome {
+	case ipc.ProfileSelectOutcomePending:
+		s.broadcastSwitchNotice(connID, "pending", switchPendingMessage(&decision.Broker.SwitchContext), summary)
+	case ipc.ProfileSelectOutcomeUpdatedPending:
+		s.broadcastSwitchNotice(connID, "updated", switchPendingMessage(&decision.Broker.SwitchContext), summary)
+	}
+	return ipc.SelectProfileResponse{
+		Outcome:         decision.Outcome,
+		ActiveProfileID: decision.ActiveProfileID,
+		PendingSwitch:   summary,
+	}, nil
+}
+
+func (s *Service) forcePendingSwitch(ctx context.Context, connID string, req ipc.ForcePendingSwitchRequest) (ipc.PendingSwitchResponse, error) {
+	s.lockSwitch()
+	defer s.unlockSwitch()
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	decision, err := s.switches.Force(brokerState, req.SessionID)
+	if err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	if decision.CommitProfileID == nil {
+		return ipc.PendingSwitchResponse{}, nil
+	}
+	result, err := s.runtime.CommitProfileSwitch(ctx, *decision.CommitProfileID, true, "profile_switch_forced")
+	if err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	state, _ := s.store.LoadState()
+	s.broadcastSwitchNotice(connID, "committed", "Account switch was forced. Live Codex sessions are reloading onto the new account.", nil)
+	s.broadcastReload(result.AuthEpochID, state.SelectedProfileID, "profile_switch_forced", true, "Account switch was forced. Live Codex sessions are reloading onto the new account.")
+	return ipc.PendingSwitchResponse{Committed: true}, nil
+}
+
+func (s *Service) cancelPendingSwitch(connID string, req ipc.CancelPendingSwitchRequest) (ipc.PendingSwitchResponse, error) {
+	s.lockSwitch()
+	defer s.unlockSwitch()
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	decision, err := s.switches.Cancel(time.Now(), brokerState, req.SessionID)
+	if err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	if err := s.store.SaveBroker(decision.Broker); err != nil {
+		return ipc.PendingSwitchResponse{}, err
+	}
+	s.broadcastSwitchNotice(connID, "cancelled", "Pending account switch cancelled.", nil)
+	return ipc.PendingSwitchResponse{Cancelled: true}, nil
+}
+
+func (s *Service) reconcilePendingSwitch(ctx context.Context, excludeConnID string, reason string) error {
+	s.lockSwitch()
+	defer s.unlockSwitch()
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return err
+	}
+	readiness, err := s.sessions.Readiness()
+	if err != nil {
+		return err
+	}
+	decision := s.switches.Reconcile(time.Now(), brokerState, switchflowpkg.Readiness(readiness))
+	if decision.CommitProfileID != nil {
+		result, err := s.runtime.CommitProfileSwitch(ctx, *decision.CommitProfileID, false, reason)
+		if err != nil {
+			return err
+		}
+		state, _ := s.store.LoadState()
+		s.broadcastSwitchNotice(excludeConnID, "committed", "Account switched. Live Codex sessions are reloading onto the new account.", nil)
+		s.broadcastReload(result.AuthEpochID, state.SelectedProfileID, reason, false, "Account switched. Live Codex sessions are reloading onto the new account.")
+		return nil
+	}
+	if decision.Broker != brokerState {
+		if err := s.store.SaveBroker(decision.Broker); err != nil {
+			return err
+		}
+		if decision.Broker.SwitchContext.InProgress {
+			s.broadcastSwitchNotice(excludeConnID, "updated", switchPendingMessage(&decision.Broker.SwitchContext), s.pendingSwitchSummary(&decision.Broker, ""))
+		}
 	}
 	return nil
 }
@@ -384,46 +485,29 @@ func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchReques
 	if brokerState.SwitchContext.InProgress {
 		return ipc.LaunchSpec{}, errors.New("profile switch is pending; wait for live Codex sessions to become idle or force/cancel the switch from Home")
 	}
-	if err := s.activateProfile(ctx, *state.SelectedProfileID, "prepare_launch"); err != nil {
+	if err := s.runtime.EnsureActiveProfile(ctx, *state.SelectedProfileID, "prepare_launch"); err != nil {
 		return ipc.LaunchSpec{}, err
 	}
-	sessions, err := s.store.LoadSessions()
+	record, selectedCwd, err := s.sessions.PrepareLaunch(req.SessionID, req.Cwd, state.SelectedProfileID, state.CurrentAuthEpochID, time.Now())
 	if err != nil {
 		return ipc.LaunchSpec{}, err
 	}
-	record, ok := sessions.Sessions[req.SessionID]
-	if !ok {
+	if record.SessionID == "" {
 		return ipc.LaunchSpec{}, fmt.Errorf("session %q not registered", req.SessionID)
-	}
-	selectedCwd := req.Cwd
-	if record.ActiveThreadID != nil && record.ResumeAllowed && record.ActiveThreadCwd != nil && *record.ActiveThreadCwd != "" {
-		selectedCwd = *record.ActiveThreadCwd
-	}
-	now := time.Now()
-	record.State = model.SessionStateLaunchingCodex
-	record.Cwd = req.Cwd
-	record.LastKnownProfileID = state.SelectedProfileID
-	record.LastSeenAuthEpochID = &state.CurrentAuthEpochID
-	record.UpdatedAt = now
-	sessions.Sessions[req.SessionID] = record
-	sessions.UpdatedAt = now
-	if err := s.store.SaveSessions(sessions); err != nil {
-		return ipc.LaunchSpec{}, err
 	}
 	mode := ipc.LaunchModeFresh
 	if record.ActiveThreadID != nil && record.ResumeAllowed {
 		mode = ipc.LaunchModeResume
 	}
-	sessionToken, err := s.issueSessionToken(req.SessionID)
+	sessionToken, err := s.gateway.IssueSessionToken(req.SessionID)
 	if err != nil {
 		return ipc.LaunchSpec{}, err
 	}
-	s.mu.Lock()
-	spec := ipc.LaunchSpec{
+	return ipc.LaunchSpec{
 		SessionID:    req.SessionID,
 		ProfileID:    *state.SelectedProfileID,
 		AuthEpochID:  state.CurrentAuthEpochID,
-		GatewayURL:   s.gatewayURL,
+		GatewayURL:   s.gateway.URL(),
 		TokenEnvName: codex.RemoteAuthTokenEnv,
 		Token:        sessionToken,
 		ThreadID:     record.ActiveThreadID,
@@ -432,9 +516,7 @@ func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchReques
 		Settings: ipc.WrapperSettings{
 			ClearTerminalBeforeLaunch: state.Settings.ClearTerminalEnabled(),
 		},
-	}
-	s.mu.Unlock()
-	return spec, nil
+	}, nil
 }
 
 func (s *Service) updateSettings(req ipc.UpdateSettingsRequest) error {
@@ -442,81 +524,35 @@ func (s *Service) updateSettings(req ipc.UpdateSettingsRequest) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now()
 	value := req.ClearTerminalBeforeLaunch
 	state.Settings.ClearTerminalBeforeLaunch = &value
-	state.UpdatedAt = now
+	state.UpdatedAt = time.Now()
 	return s.store.SaveState(state)
 }
 
 func (s *Service) returnHome(sessionID string) error {
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
-		return err
-	}
-	record, ok := sessions.Sessions[sessionID]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	record.State = model.SessionStateHome
-	record.LastReturnedHomeAt = &now
-	record.CodexChildPID = nil
-	record.UpdatedAt = now
-	sessions.Sessions[sessionID] = record
-	sessions.UpdatedAt = now
-	if err := s.store.SaveSessions(sessions); err != nil {
+	if err := s.sessions.ReturnHome(sessionID, time.Now()); err != nil {
 		return err
 	}
 	s.maybeScheduleIdleShutdown()
-	return s.reconcilePendingSwitch(context.Background(), "session_returned_home")
+	return s.reconcilePendingSwitch(context.Background(), "", "session_returned_home")
 }
 
 func (s *Service) unregisterSession(sessionID string) error {
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
+	if err := s.sessions.Unregister(sessionID, time.Now()); err != nil {
 		return err
 	}
-	if _, ok := sessions.Sessions[sessionID]; !ok {
-		s.revokeSessionTokens(sessionID)
-		s.unregisterRuntimeSession(sessionID)
-		s.maybeScheduleIdleShutdown()
-		return s.reconcilePendingSwitch(context.Background(), "session_unregistered")
-	}
-	delete(sessions.Sessions, sessionID)
-	sessions.UpdatedAt = time.Now()
-	if err := s.store.SaveSessions(sessions); err != nil {
-		return err
-	}
-	s.revokeSessionTokens(sessionID)
-	s.unregisterRuntimeSession(sessionID)
+	s.gateway.RevokeSessionTokens(sessionID)
 	s.maybeScheduleIdleShutdown()
-	return s.reconcilePendingSwitch(context.Background(), "session_unregistered")
+	return s.reconcilePendingSwitch(context.Background(), "", "session_unregistered")
 }
 
 func (s *Service) updateSessionState(req ipc.UpdateSessionStateRequest) error {
-	sessions, err := s.store.LoadSessions()
-	if err != nil {
-		return err
-	}
-	record, ok := sessions.Sessions[req.SessionID]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	record.State = req.State
-	record.CodexChildPID = req.CodexChildPID
-	if req.State == model.SessionStateInCodex {
-		record.LastEnteredCodexAt = &now
-	}
-	record.UpdatedAt = now
-	sessions.Sessions[req.SessionID] = record
-	sessions.UpdatedAt = now
-	if err := s.store.SaveSessions(sessions); err != nil {
+	if err := s.sessions.UpdateState(req.SessionID, req.State, req.CodexChildPID, time.Now()); err != nil {
 		return err
 	}
 	s.maybeScheduleIdleShutdown()
-	return s.reconcilePendingSwitch(context.Background(), "session_state_updated")
+	return s.reconcilePendingSwitch(context.Background(), "", "session_state_updated")
 }
 
 func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
@@ -524,7 +560,7 @@ func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
 	if err != nil {
 		return ipc.StatusSnapshot{}, err
 	}
-	sessions, err := s.store.LoadSessions()
+	count, err := s.sessions.SessionCount()
 	if err != nil {
 		return ipc.StatusSnapshot{}, err
 	}
@@ -532,168 +568,68 @@ func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
 		BrokerState:       brokerState.BrokerState,
 		ActiveProfileID:   brokerState.ActiveProfileID,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
-		SessionCount:      len(sessions.Sessions),
+		SessionCount:      count,
 		ServerState:       brokerState.Server.State,
 		ServerURL:         brokerState.Server.ListenURL,
 		UpdatedAt:         brokerState.UpdatedAt,
 	}, nil
 }
 
-func (s *Service) activateProfile(ctx context.Context, profileID string, reason string) error {
-	if s.canReuseActiveProfile(profileID) {
-		return s.markActiveProfile(profileID, "")
+func (s *Service) pendingSwitchSummary(brokerState *model.BrokerFile, sessionID string) *ipc.PendingSwitch {
+	if brokerState == nil || !brokerState.SwitchContext.InProgress || brokerState.SwitchContext.ToProfileID == nil {
+		return nil
 	}
-	if err := s.store.CopyProfileAuthToRuntime(profileID); err != nil {
-		return err
+	toProfileName := ""
+	if profile, err := s.store.LoadProfile(*brokerState.SwitchContext.ToProfileID); err == nil {
+		toProfileName = profile.Name
 	}
-	s.shutdownAppServer()
-	if err := s.startAppServer(ctx, profileID, reason); err != nil {
-		return err
+	readiness, _ := s.sessions.Readiness()
+	return &ipc.PendingSwitch{
+		FromProfileID:             brokerState.SwitchContext.FromProfileID,
+		ToProfileID:               brokerState.SwitchContext.ToProfileID,
+		ToProfileName:             toProfileName,
+		InitiatedByCurrentSession: brokerState.SwitchContext.InitiatedBySessionID != nil && sessionID != "" && *brokerState.SwitchContext.InitiatedBySessionID == sessionID,
+		InitiatedAt:               brokerState.SwitchContext.InitiatedAt,
+		BlockingBusySessionCount:  len(readiness.BusySessionIDs),
+		LiveCodexSessionCount:     readiness.LiveCodexSessions,
+		CanForce:                  brokerState.SwitchContext.InitiatedBySessionID != nil && sessionID != "" && *brokerState.SwitchContext.InitiatedBySessionID == sessionID,
+		CanCancel:                 brokerState.SwitchContext.InitiatedBySessionID != nil && sessionID != "" && *brokerState.SwitchContext.InitiatedBySessionID == sessionID,
 	}
-	return s.markActiveProfile(profileID, reason)
 }
 
-func (s *Service) markActiveProfile(profileID string, reason string) error {
-	state, err := s.store.LoadState()
-	if err != nil {
-		return err
+func (s *Service) broadcastSwitchNotice(excludeConnID string, phase, message string, pending *ipc.PendingSwitch) {
+	if s.server != nil {
+		s.server.BroadcastExcept(excludeConnID, "switch.notice", ipc.SwitchNotice{
+			Phase:         phase,
+			Message:       message,
+			PendingSwitch: pending,
+		})
 	}
-	brokerState, err := s.store.LoadBroker()
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	brokerState.BrokerState = model.BrokerStateActive
-	brokerState.ActiveProfileID = &profileID
-	brokerState.ActiveAuthEpochID = state.CurrentAuthEpochID
-	brokerState.Server.State = model.ServerStateHealthy
-	if s.appServerURL != "" {
-		brokerState.Server.ListenURL = &s.appServerURL
-	}
-	authMode := "capability-token"
-	brokerState.Server.AuthMode = &authMode
-	if reason != "" {
-		brokerState.Server.StartedAt = &now
-		brokerState.Server.LastRestartReason = &reason
-	}
-	brokerState.SwitchContext = model.SwitchContext{}
-	brokerState.UpdatedAt = now
-	if err := s.store.SaveBroker(brokerState); err != nil {
-		return err
-	}
-	profile, err := s.store.LoadProfile(profileID)
-	if err == nil {
-		profile.LastSelectedAt = &now
-		profile.UpdatedAt = now
-		_ = s.store.SaveProfile(profile)
-	}
-	s.clearDegraded()
-	return nil
 }
 
-func (s *Service) canReuseActiveProfile(profileID string) bool {
-	brokerState, err := s.store.LoadBroker()
-	if err != nil {
-		return false
+func (s *Service) broadcastReload(authEpochID string, profileID *string, reason string, forced bool, message string) {
+	if s.server != nil {
+		s.server.Broadcast("reload.notice", ipc.ReloadNotice{
+			AuthEpochID: authEpochID,
+			ProfileID:   profileID,
+			Reason:      reason,
+			Forced:      forced,
+			Message:     message,
+		})
 	}
-	if brokerState.ActiveProfileID == nil || *brokerState.ActiveProfileID != profileID || brokerState.Server.State != model.ServerStateHealthy {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.appServerCmd != nil && s.control != nil && s.appServerURL != ""
 }
 
-func (s *Service) startAppServer(ctx context.Context, profileID, reason string) error {
-	port, err := allocateLoopbackPort()
-	if err != nil {
-		return err
+func switchPendingMessage(ctx *model.SwitchContext) string {
+	if ctx == nil || ctx.ToProfileID == nil {
+		return ""
 	}
-	token, err := randomToken()
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(s.paths.AppServerTokenFile, []byte(token), 0o600); err != nil {
-		return err
-	}
-	listenURL := fmt.Sprintf("ws://127.0.0.1:%d", port)
-	cmd := exec.Command("codex", "app-server",
-		"--listen", listenURL,
-		"--ws-auth", "capability-token",
-		"--ws-token-file", s.paths.AppServerTokenFile,
-		"-c", "cli_auth_credentials_store=file",
-	)
-	cmd.Env = append(os.Environ(),
-		"CODEX_HOME="+s.paths.CodexHome,
-		"LOG_FORMAT=json",
-	)
-	logFile := filepath.Join(s.paths.LogsDir, "broker-app-server.log")
-	logHandle, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	cmd.Stdout = logHandle
-	cmd.Stderr = logHandle
-	if err := cmd.Start(); err != nil {
-		_ = logHandle.Close()
-		return err
-	}
-	s.mu.Lock()
-	s.appServerCmd = cmd
-	s.appServerURL = listenURL
-	s.appServerToken = token
-	s.mu.Unlock()
-	go func(cmd *exec.Cmd, f *os.File) {
-		_ = cmd.Wait()
-		_ = f.Close()
-		s.mu.Lock()
-		if s.appServerCmd == cmd {
-			s.appServerCmd = nil
-		}
-		s.mu.Unlock()
-	}(cmd, logHandle)
-	if err := waitForReady(ctx, listenURL, 8*time.Second); err != nil {
-		s.shutdownAppServer()
-		return err
-	}
-	control, err := codex.DialAppServer(ctx, listenURL, token)
-	if err != nil {
-		s.shutdownAppServer()
-		return err
-	}
-	s.mu.Lock()
-	if s.control != nil {
-		_ = s.control.Close()
-	}
-	s.control = control
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *Service) shutdownAppServer() {
-	s.mu.Lock()
-	cmd := s.appServerCmd
-	control := s.control
-	s.appServerCmd = nil
-	s.control = nil
-	s.appServerURL = ""
-	s.appServerToken = ""
-	s.mu.Unlock()
-	if control != nil {
-		_ = control.Close()
-	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}
-	brokerState, err := s.store.LoadBroker()
-	if err == nil {
-		brokerState.Server.State = model.ServerStateStopped
-		brokerState.Server.ListenURL = nil
-		brokerState.Server.AuthMode = nil
-		now := time.Now()
-		brokerState.UpdatedAt = now
-		_ = s.store.SaveBroker(brokerState)
+	switch ctx.BlockingBusySessionCount {
+	case 0:
+		return "Account switch is pending and will commit as soon as CAW rechecks live sessions."
+	case 1:
+		return "Waiting for 1 active Codex session to become idle before switching accounts."
+	default:
+		return fmt.Sprintf("Waiting for %d active Codex sessions to become idle before switching accounts.", ctx.BlockingBusySessionCount)
 	}
 }
 
@@ -712,26 +648,29 @@ func (s *Service) refreshProfileStatuses(ctx context.Context, force bool) error 
 	if len(targets) == 0 {
 		return nil
 	}
-	var wg sync.WaitGroup
 	errCh := make(chan error, len(targets))
 	sem := make(chan struct{}, maxProfileRefreshJobs)
+	done := make(chan struct{}, len(targets))
 	for _, profileID := range targets {
-		profileID := profileID
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		go func(profileID string) {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
+				done <- struct{}{}
 				return
 			}
-			defer func() { <-sem }()
+			defer func() {
+				<-sem
+				done <- struct{}{}
+			}()
 			if err := s.refreshProfileStatus(ctx, profileID); err != nil {
 				errCh <- err
 			}
-		}()
+		}(profileID)
 	}
-	wg.Wait()
+	for range targets {
+		<-done
+	}
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
@@ -742,7 +681,7 @@ func (s *Service) refreshProfileStatuses(ctx context.Context, force bool) error 
 }
 
 func (s *Service) shouldStartBackgroundRefresh() bool {
-	if s.refreshInProgress() {
+	if s.refreshing {
 		return false
 	}
 	profiles, err := s.store.ListProfiles()
@@ -758,13 +697,10 @@ func (s *Service) shouldStartBackgroundRefresh() bool {
 }
 
 func (s *Service) startBackgroundRefresh() {
-	s.mu.Lock()
 	if s.refreshing {
-		s.mu.Unlock()
 		return
 	}
 	s.refreshing = true
-	s.mu.Unlock()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTTL)
 		defer cancel()
@@ -775,25 +711,13 @@ func (s *Service) startBackgroundRefresh() {
 }
 
 func (s *Service) runProfileRefresh(ctx context.Context, force bool, alreadyMarked bool) error {
-	s.refreshRunMu.Lock()
-	defer s.refreshRunMu.Unlock()
+	s.lockRefresh()
+	defer s.unlockRefresh()
 	if !alreadyMarked {
-		s.setRefreshInProgress(true)
+		s.refreshing = true
 	}
-	defer s.setRefreshInProgress(false)
+	defer func() { s.refreshing = false }()
 	return s.refreshProfileStatuses(ctx, force)
-}
-
-func (s *Service) setRefreshInProgress(v bool) {
-	s.mu.Lock()
-	s.refreshing = v
-	s.mu.Unlock()
-}
-
-func (s *Service) refreshInProgress() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.refreshing
 }
 
 func (s *Service) refreshProfileStatus(ctx context.Context, profileID string) error {
@@ -913,9 +837,7 @@ func warningState(five *int, weekly *int) model.ProfileWarningState {
 }
 
 func (s *Service) setDegraded(err error) {
-	s.mu.Lock()
 	s.degradedReason = err.Error()
-	s.mu.Unlock()
 	brokerState, loadErr := s.store.LoadBroker()
 	if loadErr == nil {
 		brokerState.BrokerState = model.BrokerStateDegraded
@@ -924,115 +846,47 @@ func (s *Service) setDegraded(err error) {
 	}
 }
 
-func (s *Service) clearDegraded() {
-	s.mu.Lock()
-	s.degradedReason = ""
-	s.mu.Unlock()
-}
-
 func (s *Service) maybeScheduleIdleShutdown() {
 	go func() {
 		time.Sleep(idleShutdownDelay)
-		sessions, err := s.store.LoadSessions()
-		if err != nil {
+		count, err := s.sessions.SessionCount()
+		if err != nil || count > 0 {
 			return
 		}
-		if len(sessions.Sessions) > 0 {
-			return
-		}
-		s.shutdownGateway()
-		s.shutdownAppServer()
-		s.mu.Lock()
-		server := s.server
-		s.mu.Unlock()
-		if server != nil {
-			_ = server.Close()
+		s.gateway.Close()
+		s.runtime.Shutdown()
+		if s.server != nil {
+			_ = s.server.Close()
 		}
 	}()
 }
 
-func nextEpochID(counter int) string {
-	return fmt.Sprintf("epoch-%07d", counter)
+func (s *Service) lockSwitch()   { s.switchMu <- struct{}{} }
+func (s *Service) unlockSwitch() { <-s.switchMu }
+
+func (s *Service) lockRefresh()   { s.refreshRunMu <- struct{}{} }
+func (s *Service) unlockRefresh() { <-s.refreshRunMu }
+
+func (s *Service) OnGatewayConnected(ctx context.Context, sessionID string, connected bool) error {
+	s.sessions.SetGatewayConnected(sessionID, connected)
+	return s.reconcilePendingSwitch(ctx, "", "gateway_connection_changed")
 }
 
-func allocateLoopbackPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
+func (s *Service) OnThreadObserved(sessionID, threadID, cwd string) error {
+	return s.sessions.RecordThread(sessionID, threadID, cwd, time.Now())
 }
 
-func randomToken() (string, error) {
-	buf := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
+func (s *Service) OnTurnStarted(ctx context.Context, sessionID string) error {
+	s.sessions.NoteTurnStarted(sessionID)
+	return s.reconcilePendingSwitch(ctx, "", "turn_started")
 }
 
-func (s *Service) issueSessionToken(sessionID string) (string, error) {
-	token, err := randomToken()
-	if err != nil {
-		return "", err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for existingToken, existingSessionID := range s.sessionTokens {
-		if existingSessionID == sessionID {
-			delete(s.sessionTokens, existingToken)
-		}
-	}
-	s.sessionTokens[token] = sessionID
-	return token, nil
+func (s *Service) OnTurnCompleted(ctx context.Context, sessionID string) error {
+	s.sessions.NoteTurnCompleted(sessionID)
+	return s.reconcilePendingSwitch(ctx, "", "turn_completed")
 }
 
-func (s *Service) revokeSessionTokens(sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for token, existingSessionID := range s.sessionTokens {
-		if existingSessionID == sessionID {
-			delete(s.sessionTokens, token)
-		}
-	}
-}
-
-func waitForReady(ctx context.Context, rawWSURL string, timeout time.Duration) error {
-	u, err := url.Parse(rawWSURL)
-	if err != nil {
-		return err
-	}
-	switch u.Scheme {
-	case "ws":
-		u.Scheme = "http"
-	case "wss":
-		u.Scheme = "https"
-	default:
-		return fmt.Errorf("unsupported websocket scheme %q", u.Scheme)
-	}
-	u.Path = "/readyz"
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	deadline := time.Now().Add(timeout)
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-		if err != nil {
-			return err
-		}
-		resp, err := client.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			_ = resp.Body.Close()
-			return nil
-		}
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				return err
-			}
-			return errors.New("timed out waiting for app-server readiness")
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+func (s *Service) OnThreadStatus(ctx context.Context, sessionID string, status string) error {
+	s.sessions.NoteThreadStatus(sessionID, status)
+	return s.reconcilePendingSwitch(ctx, "", "thread_status_changed")
 }
