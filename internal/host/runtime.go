@@ -16,6 +16,8 @@ import (
 	"github.com/derekurban/codex-auth-wrapper/internal/store"
 )
 
+const reloadExitGracePeriod = 5 * time.Second
+
 type SignalBuffer struct {
 	mu           sync.Mutex
 	reload       *ipc.ReloadNotice
@@ -103,12 +105,16 @@ func NewSessionRuntime(client *ipc.Client, paths store.Paths, signals *SignalBuf
 
 func (r *SessionRuntime) EnterCodex() (string, error) {
 	var reloadNotice *ipc.ReloadNotice
+	var reloadDeadline time.Time
+	reloadKillIssued := false
 launchLoop:
 	for {
 		reloadMessage := ""
 		if reloadNotice != nil {
 			reloadMessage = reloadNotice.Message
 			reloadNotice = nil
+			reloadDeadline = time.Time{}
+			reloadKillIssued = false
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var spec ipc.LaunchSpec
@@ -146,6 +152,14 @@ launchLoop:
 		if err != nil {
 			return "", err
 		}
+		if cmd.Process != nil {
+			pid := cmd.Process.Pid
+			_ = r.client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
+				SessionID:     r.session,
+				State:         model.SessionStateInCodex,
+				CodexChildPID: &pid,
+			}, nil)
+		}
 		waitCh := make(chan error, 1)
 		go func() {
 			waitCh <- cmd.Wait()
@@ -171,10 +185,22 @@ launchLoop:
 			default:
 				if notice := r.signals.TakeReload(); notice != nil && isNewerAuthEpoch(notice.AuthEpochID, spec.AuthEpochID) {
 					reloadNotice = notice
+					reloadDeadline = time.Now().Add(reloadExitGracePeriod)
+					reloadKillIssued = false
 					_ = r.client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
 						SessionID: r.session,
 						State:     model.SessionStateReloading,
 					}, nil)
+				}
+				if reloadNotice != nil && !reloadDeadline.IsZero() && !reloadKillIssued && time.Now().After(reloadDeadline) {
+					// Some Codex clients do not exit promptly when the shared app-server
+					// has already been restarted underneath them. Without a bounded
+					// fallback, the visible CAW terminal can sit forever on stale
+					// "Working" output even though the thread has already completed.
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+					reloadKillIssued = true
 				}
 				time.Sleep(150 * time.Millisecond)
 			}
