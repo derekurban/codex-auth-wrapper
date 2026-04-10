@@ -9,6 +9,13 @@ This document isolates the most important behavioral contract in Codex Auth Wrap
 - how Codex sessions resume across wrapper navigation
 - how all linked wrapper instances react to an auth-context switch
 
+Implementation status note as of 2026-04-10:
+
+- this is a first-pass design doc, not the authoritative runtime spec
+- current builds use normal Codex exit to return Home; `F12` is still planned
+- wrapper sessions are live-only
+- stock `~/.codex` is the active shared Codex runtime
+
 ## Terminology
 
 ### Account profile
@@ -44,7 +51,7 @@ The wrapper must support this story cleanly:
 2. user creates and links an account
 3. user enters Codex
 4. user works in a thread
-5. user returns to the wrapper home page with `F12`
+5. user returns to the wrapper home page after exiting Codex
 6. user switches accounts
 7. wrapper reloads the shared runtime
 8. user presses `Enter`
@@ -134,14 +141,13 @@ If no current thread id exists:
 
 ### Trigger
 
-The user presses `F12`.
+Planned behavior is `F12`, but current builds return after normal Codex exit.
 
 ### Required wrapper behavior
 
-1. intercept `F12`
+1. detect that the Codex child exited
 2. capture the visible session’s latest known active thread id
-3. stop or detach the Codex child cleanly
-4. return to the wrapper home TUI
+3. return to the wrapper home TUI
 
 ### Required state update
 

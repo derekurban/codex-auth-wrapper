@@ -4,6 +4,13 @@
 
 Draft v1.
 
+Implementation status note as of 2026-04-10:
+
+- the Home TUI is implemented
+- `F12` return from inside Codex is still planned, not implemented
+- current return path from Codex is normal child exit / `Ctrl+C`
+- use the architecture docs for current runtime behavior when this draft conflicts
+
 This document is normative where it uses:
 
 - must
@@ -53,7 +60,6 @@ The wrapper home TUI must support:
 - `Esc`
 - arrow keys
 - `Tab` where useful
-- `F12`
 - `Q`
 
 ### Global navigation rules
@@ -61,7 +67,7 @@ The wrapper home TUI must support:
 - `Enter` confirms the current primary action
 - `Esc` returns to the previous wrapper screen
 - `Q` exits the wrapper when not inside Codex
-- `F12` is reserved as the return path from Codex back to the wrapper home TUI
+- `F12` is reserved as a future return path from Codex back to the wrapper home TUI
 
 ### Home page shortcut hints
 
@@ -72,7 +78,7 @@ The home screen must visibly teach:
 - `M` manage accounts
 - `S` switch account
 - `Q` quit
-- `F12` returns here from Codex
+- current builds return here after Codex exits normally
 
 ## Screen 1: Home
 
@@ -418,15 +424,18 @@ If not:
 
 ### Trigger
 
-Inside Codex, `F12` must return the user to the wrapper Home screen.
+Planned behavior: inside Codex, `F12` should return the user to the wrapper
+Home screen.
 
-### Required behavior
+### Current implementation
 
-On `F12`, the wrapper must:
+Current builds do not intercept `F12`.
 
-1. capture the visible session’s current active Codex thread id
-2. stop or detach the Codex child
-3. return to Home
+Instead:
+
+1. the user exits Codex normally
+2. CAW returns to Home
+3. the tracked thread id is reused on the next `Enter`
 
 ### Required note
 

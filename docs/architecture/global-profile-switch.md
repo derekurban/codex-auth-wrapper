@@ -29,6 +29,11 @@ On commit:
 6. Idle live Codex sessions relaunch and resume the tracked thread.
 7. Home sessions refresh to the new active profile.
 
+If a reloaded Codex child does not exit promptly after the app-server restart,
+the host runtime applies a bounded grace period and then terminates the stale
+child so the session can continue the relaunch/resume path instead of hanging on
+stale terminal output.
+
 ## Forced behavior
 
 Forced switch exists as an explicit override. It may interrupt active work and

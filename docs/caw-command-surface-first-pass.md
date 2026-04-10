@@ -8,6 +8,12 @@ This document assumes:
 - repository/package name: `codex-auth-wrapper`
 - CLI command: `caw`
 
+Implementation status note as of 2026-04-10:
+
+- this is a first-pass command design doc
+- current implemented commands are `caw`, `caw status`, `caw shutdown`, and `caw broker start|stop|restart`
+- `doctor`, `broker logs`, and the `F12` return path remain planned rather than implemented
+
 ## Design Direction
 
 The command surface should be intentionally small because normal management belongs inside the TUI.

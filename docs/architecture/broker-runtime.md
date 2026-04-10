@@ -30,10 +30,17 @@ profile vault in `~/.codex-auth-wrapper`.
 - `Gateway`
   - Observes stock Codex websocket traffic and translates it into session
     events.
+  - Observation must not block websocket frame delivery to the visible Codex
+    client. Session bookkeeping and switch reconciliation happen off the proxy
+    hot path so a slow broker callback cannot strand the user on stale
+    "Working" output after the backend has already completed.
   - It is not allowed to mutate persisted state directly.
 
 - `HostSessionRuntime`
   - Owns one CAW terminal's Codex child process and reload/relaunch policy.
+  - Applies a bounded wait during reload; if a stale Codex child does not exit
+    after the shared app-server has already moved on, CAW terminates that stale
+    child and continues the relaunch path.
 
 ## Session lifetime
 
@@ -52,3 +59,5 @@ Wrapper sessions are live-only.
 - Normal account switching must not interrupt an active Codex turn.
 - Switching auth means reconnecting/relaunching Codex, not mutating tokens in
   place inside a live Codex client.
+- Reloaded sessions must not wait forever for a stale Codex child to exit once
+  the auth epoch has advanced.

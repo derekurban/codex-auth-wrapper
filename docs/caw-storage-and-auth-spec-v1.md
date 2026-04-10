@@ -4,6 +4,12 @@
 
 Draft v1.
 
+Current implementation note as of 2026-04-10:
+
+- stock Codex home is `~/.codex`
+- CAW does not run a parallel wrapper-owned runtime home anymore
+- `sessions.json` is a live-session mirror, not a crash-recovery source for a new CAW launch
+
 ## Purpose
 
 This document defines the storage model and auth-handling rules for Codex Auth Wrapper.
@@ -42,14 +48,16 @@ If desired, a single manifest file can still exist inside that directory.
 
 ## Relationship To `~/.codex`
 
-The wrapper must not treat the user’s default `~/.codex` as the source of truth for managed profiles.
+The wrapper must not treat the user’s default `~/.codex` as the source of truth
+for managed profiles, but it does use stock `~/.codex` as the active Codex
+runtime at steady state.
 
-Instead:
+That means:
 
 - stock Codex login may temporarily write to a Codex home chosen by the wrapper
 - the wrapper then copies the resulting `auth.json`
 - the wrapper stores the copied file under its own managed profile storage
-- the wrapper later materializes one selected profile into the shared runtime Codex home
+- the wrapper later materializes one selected profile into the stock shared Codex home at `~/.codex`
 
 ## Core Rule For Auth
 
@@ -110,13 +118,7 @@ Recommended wrapper home layout:
       profile.json
       auth.json
   runtime/
-    codex-home/
-      auth.json
-      config.toml
-      sessions/
-      archived_sessions/
-      sqlite/
-      log/
+    app-server-token.txt
 ```
 
 ## JSON Files
@@ -203,22 +205,21 @@ Recommended pattern:
 
 ## Shared Runtime Rules
 
-The shared runtime Codex home should live under wrapper storage, not under the user’s unmanaged default `~/.codex`.
-
-Recommended path:
+The active shared Codex runtime is the stock user home:
 
 ```text
-~/.codex-auth-wrapper/runtime/codex-home/
+~/.codex/
 ```
 
-This runtime is where the selected profile’s `auth.json` is materialized for active use.
+CAW-owned storage under `~/.codex-auth-wrapper/` holds metadata, profile vault
+copies, logs, and support files, but not the primary active Codex session store.
 
 ## Profile Selection Rules
 
 At any given time:
 
 - exactly one profile is selected for the shared runtime
-- that selected profile’s `auth.json` must be copied into `runtime/codex-home/auth.json`
+- that selected profile’s `auth.json` must be copied into `~/.codex/auth.json`
 
 When profile selection changes:
 
@@ -228,11 +229,15 @@ When profile selection changes:
 
 ## Session Persistence Rules
 
-The wrapper must persist enough session state to survive:
+The wrapper must persist enough session state to coordinate currently live CAW
+windows during the lifetime of the running broker.
 
-- returning to Home with `F12`
-- shared server restart
-- auth context switch
+Current implementation:
+
+- `sessions.json` mirrors live sessions only
+- returning to Home and re-entering within the same CAW window preserves that session's tracked thread
+- fully exiting CAW and launching it again creates a fresh wrapper session
+- shared server restart and auth context switch may still use the live-session mirror while the broker is alive
 
 Minimum required session state:
 

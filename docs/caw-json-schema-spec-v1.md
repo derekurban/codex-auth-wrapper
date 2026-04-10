@@ -4,6 +4,12 @@
 
 Draft v1.
 
+Current implementation note as of 2026-04-10:
+
+- `sessions.json` is a live-session mirror only
+- a new broker startup clears stale sessions instead of recovering them
+- use [docs/architecture/broker-runtime.md](D:/Working/codex-auth-wrapper/docs/architecture/broker-runtime.md) as the current runtime authority
+
 This document defines the wrapper-owned JSON files under:
 
 ```text
@@ -134,7 +140,9 @@ Registry of visible wrapper sessions.
 
 ### Authority
 
-This file is the source of truth for wrapper-managed visible-session continuity, not for Codex conversation contents.
+This file is a broker-owned live-session mirror for the currently running CAW
+windows. It is not the recovery source for a new broker lifetime, and it is not
+the source of truth for Codex conversation contents.
 
 ### Schema
 
@@ -204,7 +212,7 @@ Allowed `state` values:
 
 - `active_thread_id` may be null for never-started sessions
 - `resume_pending=true` should imply `resume_allowed=true`
-- `state=closed` sessions may be retained briefly, but should be pruned eventually
+- startup may clear all stale sessions and begin with an empty object
 
 ## `broker.json`
 
@@ -383,7 +391,8 @@ Example entry:
 
 ### Recommendation
 
-This file should be optional but strongly recommended for implementation.
+This file remains optional and is not currently the architectural source of
+truth for recovery.
 
 It is useful for:
 

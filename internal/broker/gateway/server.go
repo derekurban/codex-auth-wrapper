@@ -65,6 +65,10 @@ type observation struct {
 	ThreadStatus string
 }
 
+func (o observation) empty() bool {
+	return o.Thread == nil && !o.TurnStarted && !o.TurnComplete && o.ThreadStatus == ""
+}
+
 func New(backendResolver BackendResolver, cwdResolver CwdResolver, observer Observer) *Server {
 	return &Server{
 		backendResolver: backendResolver,
@@ -190,12 +194,35 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer backendConn.Close()
 
 	state := &connState{pending: map[string]pendingThreadRequest{}}
+	observations := make(chan observation, 64)
+	observerDone := make(chan struct{})
+	observerCtx, observerCancel := context.WithCancel(context.Background())
 	if s.observer != nil {
 		_ = s.observer.OnGatewayConnected(context.Background(), sessionID, true)
 		defer func() {
 			_ = s.observer.OnGatewayConnected(context.Background(), sessionID, false)
 		}()
+		// Broker observation must never sit on the websocket hot path. A slow
+		// bookkeeping callback or pending-switch reconciliation must not delay
+		// `turn/completed` delivery to the visible Codex client.
+		go func() {
+			defer close(observerDone)
+			for {
+				select {
+				case <-observerCtx.Done():
+					return
+				case observation := <-observations:
+					s.dispatchObservation(sessionID, observation)
+				}
+			}
+		}()
+	} else {
+		close(observerDone)
 	}
+	defer func() {
+		observerCancel()
+		<-observerDone
+	}()
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -208,24 +235,34 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		errCh <- proxyFrames(backendConn, clientConn, nil, func(data []byte) {
 			observation := state.trackServerMessage(data)
-			if s.observer == nil {
+			if s.observer == nil || observation.empty() {
 				return
 			}
-			if observation.Thread != nil {
-				_ = s.observer.OnThreadObserved(sessionID, observation.Thread.ID, observation.Thread.Cwd)
-			}
-			if observation.TurnStarted {
-				_ = s.observer.OnTurnStarted(context.Background(), sessionID)
-			}
-			if observation.TurnComplete {
-				_ = s.observer.OnTurnCompleted(context.Background(), sessionID)
-			}
-			if observation.ThreadStatus != "" {
-				_ = s.observer.OnThreadStatus(context.Background(), sessionID, observation.ThreadStatus)
+			select {
+			case observations <- observation:
+			case <-observerCtx.Done():
 			}
 		})
 	}()
 	<-errCh
+}
+
+func (s *Server) dispatchObservation(sessionID string, observation observation) {
+	if s.observer == nil {
+		return
+	}
+	if observation.Thread != nil {
+		_ = s.observer.OnThreadObserved(sessionID, observation.Thread.ID, observation.Thread.Cwd)
+	}
+	if observation.TurnStarted {
+		_ = s.observer.OnTurnStarted(context.Background(), sessionID)
+	}
+	if observation.TurnComplete {
+		_ = s.observer.OnTurnCompleted(context.Background(), sessionID)
+	}
+	if observation.ThreadStatus != "" {
+		_ = s.observer.OnThreadStatus(context.Background(), sessionID, observation.ThreadStatus)
+	}
 }
 
 func (s *Server) authContext(r *http.Request) (string, string, string, bool) {
@@ -303,6 +340,9 @@ func proxyFrames(src *websocket.Conn, dst *websocket.Conn, rewrite func([]byte) 
 		}
 		if err := dst.WriteMessage(messageType, data); err != nil {
 			return err
+		}
+		if messageType == websocket.TextMessage && inspect != nil {
+			inspect(data)
 		}
 	}
 }

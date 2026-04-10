@@ -4,6 +4,12 @@
 
 Draft v1.
 
+Implementation status note as of 2026-04-10:
+
+- wrapper sessions are live-only and stale `sessions.json` state is cleared on startup
+- `F12` return is still planned; current return path is normal Codex exit
+- use [docs/architecture/broker-runtime.md](D:/Working/codex-auth-wrapper/docs/architecture/broker-runtime.md) and [docs/architecture/global-profile-switch.md](D:/Working/codex-auth-wrapper/docs/architecture/global-profile-switch.md) as the runtime source of truth
+
 ## Purpose
 
 This document defines the runtime state transitions that the wrapper must support.
@@ -123,7 +129,6 @@ The wrapper should not jump directly:
 - `home`
 - `launching_codex`
 - `in_codex`
-- `returning_home`
 - `reloading`
 - `resume_failed`
 - `closed`
@@ -142,10 +147,6 @@ This visible wrapper session has requested entry into Codex and is waiting for t
 
 This visible wrapper session is currently inside stock Codex.
 
-#### `returning_home`
-
-The user pressed `F12` and the wrapper is capturing session state and returning to Home.
-
 #### `reloading`
 
 This visible session is being reloaded because the shared auth context changed.
@@ -163,8 +164,7 @@ This visible session is no longer active.
 - `home` -> `launching_codex`
 - `launching_codex` -> `in_codex`
 - `launching_codex` -> `resume_failed`
-- `in_codex` -> `returning_home`
-- `returning_home` -> `home`
+- `in_codex` -> `home`
 - `in_codex` -> `reloading`
 - `home` -> `reloading`
 - `reloading` -> `in_codex`
@@ -255,15 +255,13 @@ The user disabled this profile manually.
 9. session -> `in_codex`
 10. broker -> `active`
 
-### Flow 3: Return from Codex with `F12`
+### Flow 3: Return from Codex
 
 1. session `in_codex`
-2. user presses `F12`
-3. session -> `returning_home`
-4. wrapper captures current `active_thread_id`
-5. Codex child stopped or detached
-6. session -> `home`
-7. if no other sessions remain in Codex, broker may return to `home_ready`
+2. user exits Codex normally
+3. wrapper captures current `active_thread_id`
+4. session -> `home`
+5. if no other sessions remain in Codex, broker may return to `home_ready`
 
 ### Flow 4: Switch profile from Home
 
@@ -336,10 +334,11 @@ Must update:
 
 On next startup, the wrapper should:
 
-1. read `state.json`, `broker.json`, and `sessions.json`
-2. if `broker_state` was `switching_profile` or `reloading_sessions`, treat startup as interrupted recovery
-3. reconcile selected profile and runtime auth artifact
-4. move to `home_ready` or `degraded`
+1. read `state.json` and `broker.json`
+2. clear stale live-session state from `sessions.json`
+3. clear stale pending-switch state
+4. reconcile selected profile and runtime auth artifact
+5. move to `home_ready` or `degraded`
 
 ### Session crash
 

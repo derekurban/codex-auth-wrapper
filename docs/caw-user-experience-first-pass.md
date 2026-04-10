@@ -10,6 +10,13 @@ The product should be described consistently as:
 
 This document replaces the earlier `cbx` framing.
 
+Implementation status note as of 2026-04-10:
+
+- this is a first-pass UX draft, not the exact current behavior contract
+- current builds do not intercept `F12` yet
+- current return path from Codex is normal exit / `Ctrl+C`
+- stock `~/.codex` is the active shared Codex runtime
+
 ## Product Position
 
 Codex Auth Wrapper should feel like a thin shell around normal Codex that adds shared auth management and a wrapper-owned home screen.
@@ -20,7 +27,7 @@ The intended experience is:
 - `caw` opens its own TUI landing page first
 - the user can manage accounts and select the active auth context from that TUI
 - pressing `Enter` moves the user into stock Codex
-- pressing `F12` from Codex returns the user to the wrapper home page
+- exiting Codex returns the user to the wrapper home page; `F12` remains planned
 
 The wrapper should own navigation and auth management.
 Codex should remain the actual coding experience.
