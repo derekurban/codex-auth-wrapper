@@ -28,8 +28,9 @@ var (
 )
 
 type hostSignals struct {
-	mu     sync.Mutex
-	reload *ipc.ReloadNotice
+	mu           sync.Mutex
+	reload       *ipc.ReloadNotice
+	switchNotice *ipc.SwitchNotice
 }
 
 func (s *hostSignals) setReload(notice ipc.ReloadNotice) {
@@ -39,15 +40,38 @@ func (s *hostSignals) setReload(notice ipc.ReloadNotice) {
 	s.reload = &copy
 }
 
-func (s *hostSignals) takeReload() *homeui.ExternalEvent {
+func (s *hostSignals) takeHomeEvent() *homeui.ExternalEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.switchNotice != nil {
+		event := &homeui.ExternalEvent{Switch: s.switchNotice}
+		s.switchNotice = nil
+		return event
+	}
 	if s.reload == nil {
 		return nil
 	}
 	event := &homeui.ExternalEvent{Reload: s.reload}
 	s.reload = nil
 	return event
+}
+
+func (s *hostSignals) takeReload() *ipc.ReloadNotice {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reload == nil {
+		return nil
+	}
+	notice := s.reload
+	s.reload = nil
+	return notice
+}
+
+func (s *hostSignals) setSwitchNotice(notice ipc.SwitchNotice) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := notice
+	s.switchNotice = &copy
 }
 
 func main() {
@@ -144,14 +168,20 @@ func unregisterSession(client *ipc.Client, sessionID string) {
 func runHost(paths store.Paths) error {
 	signals := &hostSignals{}
 	client, err := ensureClient(paths, func(name string, payload json.RawMessage) {
-		if name != "reload.notice" {
-			return
+		switch name {
+		case "reload.notice":
+			var notice ipc.ReloadNotice
+			if err := json.Unmarshal(payload, &notice); err != nil {
+				return
+			}
+			signals.setReload(notice)
+		case "switch.notice":
+			var notice ipc.SwitchNotice
+			if err := json.Unmarshal(payload, &notice); err != nil {
+				return
+			}
+			signals.setSwitchNotice(notice)
 		}
-		var notice ipc.ReloadNotice
-		if err := json.Unmarshal(payload, &notice); err != nil {
-			return
-		}
-		signals.setReload(notice)
 	})
 	if err != nil {
 		return err
@@ -175,7 +205,7 @@ func runHost(paths store.Paths) error {
 
 	statusMessage := ""
 	for {
-		action, err := homeui.Run(client, signals.takeReload, sessionID, statusMessage)
+		action, err := homeui.Run(client, signals.takeHomeEvent, sessionID, statusMessage)
 		if err != nil {
 			return err
 		}
@@ -232,8 +262,14 @@ func addProfileFlow(client *ipc.Client, action homeui.Action) (string, error) {
 }
 
 func launchCodexFlow(client *ipc.Client, paths store.Paths, signals *hostSignals, sessionID string, cwd string) (string, error) {
-	pendingReload := false
+	var reloadNotice *ipc.ReloadNotice
+launchLoop:
 	for {
+		reloadMessage := ""
+		if reloadNotice != nil {
+			reloadMessage = reloadNotice.Message
+			reloadNotice = nil
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var spec ipc.LaunchSpec
 		err := client.Request(ctx, "launch.prepare", ipc.PrepareLaunchRequest{
@@ -254,6 +290,10 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, signals *hostSignals
 			clearTerminal()
 		}
 		fmt.Println()
+		if reloadMessage != "" {
+			fmt.Println(reloadMessage)
+			fmt.Println()
+		}
 		if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 			fmt.Printf("Resuming stock Codex thread %s.\n", *spec.ThreadID)
 		} else {
@@ -274,20 +314,33 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, signals *hostSignals
 		for {
 			select {
 			case err := <-waitCh:
+				if reloadNotice != nil && isNewerAuthEpoch(reloadNotice.AuthEpochID, spec.AuthEpochID) {
+					continue launchLoop
+				}
 				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_ = client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: sessionID}, nil)
 				homeCancel()
 				if err != nil {
 					var exitErr *exec.ExitError
 					if errors.As(err, &exitErr) {
-						return returnHomeMessage(spec, pendingReload), nil
+						return returnHomeMessage(spec, false), nil
 					}
 					return "", err
 				}
-				return returnHomeMessage(spec, pendingReload), nil
+				return returnHomeMessage(spec, false), nil
 			default:
-				if event := signals.takeReload(); event != nil && event.Reload != nil && isNewerAuthEpoch(event.Reload.AuthEpochID, spec.AuthEpochID) {
-					pendingReload = true
+				if notice := signals.takeReload(); notice != nil && isNewerAuthEpoch(notice.AuthEpochID, spec.AuthEpochID) {
+					reloadNotice = notice
+					_ = client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
+						SessionID: sessionID,
+						State:     model.SessionStateReloading,
+					}, nil)
+					// Auth changes are connection-bound in stock Codex, so a
+					// committed global switch is applied by restarting the live
+					// Codex child and resuming the tracked thread on the new epoch.
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
 				}
 				time.Sleep(150 * time.Millisecond)
 			}

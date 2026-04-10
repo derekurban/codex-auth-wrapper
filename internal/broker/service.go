@@ -46,6 +46,8 @@ type Service struct {
 	appServerToken string
 	gatewayURL     string
 	sessionTokens  map[string]string
+	connSessions   map[string]string
+	sessionRuntime map[string]*sessionRuntime
 	control        *codex.AppServerClient
 	degradedReason string
 	refreshing     bool
@@ -53,9 +55,11 @@ type Service struct {
 
 func New(paths store.Paths) *Service {
 	return &Service{
-		paths:         paths,
-		store:         store.New(paths),
-		sessionTokens: map[string]string{},
+		paths:          paths,
+		store:          store.New(paths),
+		sessionTokens:  map[string]string{},
+		connSessions:   map[string]string{},
+		sessionRuntime: map[string]*sessionRuntime{},
 	}
 }
 
@@ -103,17 +107,22 @@ func (s *Service) reconcileStartup(ctx context.Context) error {
 		brokerState.UpdatedAt = time.Now()
 		return s.store.SaveBroker(brokerState)
 	}
+	if brokerState.SwitchContext.InProgress && brokerState.SwitchContext.ToProfileID != nil {
+		return s.commitProfileSwitch(ctx, *brokerState.SwitchContext.ToProfileID, false, "startup_pending_switch")
+	}
 	return s.activateProfile(ctx, *state.SelectedProfileID, "startup")
 }
 
 func (s *Service) handleIPC(ctx context.Context, connID string, method string, payload json.RawMessage) (any, error) {
 	switch method {
+	case "$connection.closed":
+		return ipc.Empty{}, s.handleConnectionClosed(ctx, connID)
 	case "session.register":
 		var req ipc.RegisterSessionRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return ipc.Empty{}, s.registerSession(req)
+		return ipc.Empty{}, s.registerSession(connID, req)
 	case "home.snapshot":
 		var req ipc.HomeSnapshotRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -131,7 +140,19 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
-		return ipc.Empty{}, s.selectProfile(ctx, connID, req)
+		return s.selectProfile(ctx, connID, req)
+	case "profile.switch.force":
+		var req ipc.ForcePendingSwitchRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return s.forcePendingSwitch(ctx, req)
+	case "profile.switch.cancel":
+		var req ipc.CancelPendingSwitchRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		return s.cancelPendingSwitch(req)
 	case "launch.prepare":
 		var req ipc.PrepareLaunchRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -188,7 +209,7 @@ func (s *Service) handleIPC(ctx context.Context, connID string, method string, p
 	}
 }
 
-func (s *Service) registerSession(req ipc.RegisterSessionRequest) error {
+func (s *Service) registerSession(connID string, req ipc.RegisterSessionRequest) error {
 	sessions, err := s.store.LoadSessions()
 	if err != nil {
 		return err
@@ -210,7 +231,14 @@ func (s *Service) registerSession(req ipc.RegisterSessionRequest) error {
 	}
 	sessions.Sessions[req.SessionID] = record
 	sessions.UpdatedAt = now
-	return s.store.SaveSessions(sessions)
+	if err := s.store.SaveSessions(sessions); err != nil {
+		return err
+	}
+	// Host IPC connections are the broker's source of truth for whether a CAW
+	// window is still alive. Pending global switches should not wait on windows
+	// that have already disconnected.
+	s.bindHostConnection(req.SessionID, connID)
+	return nil
 }
 
 func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest) (ipc.HomeSnapshotResponse, error) {
@@ -238,6 +266,10 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 		return ipc.HomeSnapshotResponse{}, err
 	}
 	summaries := make([]ipc.ProfileSummary, 0, len(profiles))
+	pendingTargetID := ""
+	if brokerState.SwitchContext.InProgress && brokerState.SwitchContext.ToProfileID != nil {
+		pendingTargetID = *brokerState.SwitchContext.ToProfileID
+	}
 	for _, profile := range profiles {
 		selected := state.SelectedProfileID != nil && *state.SelectedProfileID == profile.ID
 		summaries = append(summaries, ipc.ProfileSummary{
@@ -257,6 +289,7 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 			LastCheckedAt:        profile.Status.LastCheckedAt,
 			LastError:            profile.Status.LastError,
 			Selected:             selected,
+			PendingTarget:        pendingTargetID != "" && pendingTargetID == profile.ID,
 		})
 	}
 	resp := ipc.HomeSnapshotResponse{
@@ -267,6 +300,7 @@ func (s *Service) homeSnapshot(ctx context.Context, req ipc.HomeSnapshotRequest)
 		},
 		BrokerState:       brokerState.BrokerState,
 		ActiveAuthEpochID: brokerState.ActiveAuthEpochID,
+		PendingSwitch:     s.pendingSwitchSummary(&brokerState, req.SessionID),
 		RefreshInProgress: s.refreshInProgress(),
 	}
 	if session, ok := sessions.Sessions[req.SessionID]; ok {
@@ -332,39 +366,20 @@ func (s *Service) addProfile(req ipc.AddProfileRequest) error {
 	return nil
 }
 
-func (s *Service) selectProfile(ctx context.Context, connID string, req ipc.SelectProfileRequest) error {
-	state, err := s.store.LoadState()
-	if err != nil {
-		return err
-	}
-	if state.SelectedProfileID != nil && *state.SelectedProfileID == req.ProfileID {
-		return nil
-	}
-	if !s.store.ProfileExists(req.ProfileID) {
-		return fmt.Errorf("profile %q does not exist", req.ProfileID)
-	}
-	now := time.Now()
-	state.SelectedProfileID = &req.ProfileID
-	state.CurrentAuthEpochID = nextEpochID(state.NextAuthEpochCounter)
-	state.NextAuthEpochCounter++
-	state.UpdatedAt = now
-	if err := s.store.SaveState(state); err != nil {
-		return err
-	}
-	if err := s.activateProfile(ctx, req.ProfileID, "profile_switch"); err != nil {
-		return err
-	}
-	s.broadcastReload(connID, state.CurrentAuthEpochID, state.SelectedProfileID, "profile_switched")
-	return nil
-}
-
 func (s *Service) prepareLaunch(ctx context.Context, req ipc.PrepareLaunchRequest) (ipc.LaunchSpec, error) {
 	state, err := s.store.LoadState()
 	if err != nil {
 		return ipc.LaunchSpec{}, err
 	}
+	brokerState, err := s.store.LoadBroker()
+	if err != nil {
+		return ipc.LaunchSpec{}, err
+	}
 	if state.SelectedProfileID == nil {
 		return ipc.LaunchSpec{}, errors.New("no selected profile")
+	}
+	if brokerState.SwitchContext.InProgress {
+		return ipc.LaunchSpec{}, errors.New("profile switch is pending; wait for live Codex sessions to become idle or force/cancel the switch from Home")
 	}
 	if err := s.activateProfile(ctx, *state.SelectedProfileID, "prepare_launch"); err != nil {
 		return ipc.LaunchSpec{}, err
@@ -451,7 +466,7 @@ func (s *Service) returnHome(sessionID string) error {
 		return err
 	}
 	s.maybeScheduleIdleShutdown()
-	return nil
+	return s.reconcilePendingSwitch(context.Background(), "session_returned_home")
 }
 
 func (s *Service) unregisterSession(sessionID string) error {
@@ -461,8 +476,9 @@ func (s *Service) unregisterSession(sessionID string) error {
 	}
 	if _, ok := sessions.Sessions[sessionID]; !ok {
 		s.revokeSessionTokens(sessionID)
+		s.unregisterRuntimeSession(sessionID)
 		s.maybeScheduleIdleShutdown()
-		return nil
+		return s.reconcilePendingSwitch(context.Background(), "session_unregistered")
 	}
 	delete(sessions.Sessions, sessionID)
 	sessions.UpdatedAt = time.Now()
@@ -470,8 +486,9 @@ func (s *Service) unregisterSession(sessionID string) error {
 		return err
 	}
 	s.revokeSessionTokens(sessionID)
+	s.unregisterRuntimeSession(sessionID)
 	s.maybeScheduleIdleShutdown()
-	return nil
+	return s.reconcilePendingSwitch(context.Background(), "session_unregistered")
 }
 
 func (s *Service) updateSessionState(req ipc.UpdateSessionStateRequest) error {
@@ -496,7 +513,7 @@ func (s *Service) updateSessionState(req ipc.UpdateSessionStateRequest) error {
 		return err
 	}
 	s.maybeScheduleIdleShutdown()
-	return nil
+	return s.reconcilePendingSwitch(context.Background(), "session_state_updated")
 }
 
 func (s *Service) statusSnapshot() (ipc.StatusSnapshot, error) {
@@ -889,19 +906,6 @@ func warningState(five *int, weekly *int) model.ProfileWarningState {
 		return model.ProfileWarningWeekly
 	default:
 		return model.ProfileWarningNone
-	}
-}
-
-func (s *Service) broadcastReload(excludeConnID string, authEpochID string, profileID *string, reason string) {
-	s.mu.Lock()
-	server := s.server
-	s.mu.Unlock()
-	if server != nil {
-		server.BroadcastExcept(excludeConnID, "reload.notice", ipc.ReloadNotice{
-			AuthEpochID: authEpochID,
-			ProfileID:   profileID,
-			Reason:      reason,
-		})
 	}
 }
 

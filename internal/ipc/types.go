@@ -49,6 +49,7 @@ type HomeSnapshotResponse struct {
 	Settings          WrapperSettings      `json:"settings"`
 	BrokerState       model.BrokerState    `json:"broker_state"`
 	ActiveAuthEpochID string               `json:"active_auth_epoch_id"`
+	PendingSwitch     *PendingSwitch       `json:"pending_switch"`
 	RefreshInProgress bool                 `json:"refresh_in_progress"`
 	DegradedReason    *string              `json:"degraded_reason"`
 }
@@ -74,6 +75,19 @@ type ProfileSummary struct {
 	LastCheckedAt        *time.Time                `json:"last_checked_at"`
 	LastError            string                    `json:"last_error"`
 	Selected             bool                      `json:"selected"`
+	PendingTarget        bool                      `json:"pending_target"`
+}
+
+type PendingSwitch struct {
+	FromProfileID             *string    `json:"from_profile_id"`
+	ToProfileID               *string    `json:"to_profile_id"`
+	ToProfileName             string     `json:"to_profile_name"`
+	InitiatedByCurrentSession bool       `json:"initiated_by_current_session"`
+	InitiatedAt               *time.Time `json:"initiated_at"`
+	BlockingBusySessionCount  int        `json:"blocking_busy_session_count"`
+	LiveCodexSessionCount     int        `json:"live_codex_session_count"`
+	CanForce                  bool       `json:"can_force"`
+	CanCancel                 bool       `json:"can_cancel"`
 }
 
 type AddProfileRequest struct {
@@ -85,6 +99,35 @@ type AddProfileRequest struct {
 type SelectProfileRequest struct {
 	SessionID string `json:"session_id"`
 	ProfileID string `json:"profile_id"`
+}
+
+type ProfileSelectOutcome string
+
+const (
+	ProfileSelectOutcomeNoop           ProfileSelectOutcome = "noop"
+	ProfileSelectOutcomeSwitched       ProfileSelectOutcome = "switched"
+	ProfileSelectOutcomePending        ProfileSelectOutcome = "pending"
+	ProfileSelectOutcomeUpdatedPending ProfileSelectOutcome = "updated_pending"
+)
+
+type SelectProfileResponse struct {
+	Outcome         ProfileSelectOutcome `json:"outcome"`
+	ActiveProfileID *string              `json:"active_profile_id"`
+	PendingSwitch   *PendingSwitch       `json:"pending_switch,omitempty"`
+}
+
+type ForcePendingSwitchRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+type CancelPendingSwitchRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+type PendingSwitchResponse struct {
+	Cancelled     bool           `json:"cancelled,omitempty"`
+	Committed     bool           `json:"committed,omitempty"`
+	PendingSwitch *PendingSwitch `json:"pending_switch,omitempty"`
 }
 
 type PrepareLaunchRequest struct {
@@ -144,6 +187,14 @@ type ReloadNotice struct {
 	AuthEpochID string  `json:"auth_epoch_id"`
 	ProfileID   *string `json:"profile_id"`
 	Reason      string  `json:"reason"`
+	Forced      bool    `json:"forced"`
+	Message     string  `json:"message,omitempty"`
+}
+
+type SwitchNotice struct {
+	Phase         string         `json:"phase"`
+	Message       string         `json:"message"`
+	PendingSwitch *PendingSwitch `json:"pending_switch,omitempty"`
 }
 
 type MessageNotice struct {

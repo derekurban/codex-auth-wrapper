@@ -120,6 +120,7 @@ func (s *Server) handleConn(ctx context.Context, conn *serverConn) {
 		s.connsMu.Lock()
 		delete(s.conns, conn.id)
 		s.connsMu.Unlock()
+		_, _ = s.handler(context.Background(), conn.id, "$connection.closed", nil)
 	}()
 	dec := json.NewDecoder(conn.conn)
 	for {

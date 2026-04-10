@@ -68,11 +68,11 @@ At least one visible session is in or entering Codex under the current auth epoc
 
 #### `switching_profile`
 
-Wrapper is changing the selected profile and restarting the shared runtime.
+Wrapper has a pending or in-progress global account switch.
 
 #### `reloading_sessions`
 
-Wrapper has completed the profile switch and is resuming affected linked sessions under the new auth epoch.
+Wrapper has completed the profile switch and is reloading affected linked sessions under the new auth epoch.
 
 #### `degraded`
 
@@ -269,15 +269,24 @@ The user disabled this profile manually.
 
 1. broker `home_ready` or `active`
 2. user chooses new profile
-3. broker -> `switching_profile`
-4. wrapper snapshots current session/thread mapping
-5. runtime auth copied back to old profile if needed
+3. if any live Codex session is busy, broker -> `switching_profile`
+4. Home shows a pending-switch state and waits for all live Codex sessions to become idle
+5. if no blocking busy sessions remain, runtime auth copied back to old profile if needed
 6. new profile auth copied into shared runtime
 7. shared server restarted
 8. broker -> `reloading_sessions`
 9. affected sessions -> `reloading`
-10. each session either returns to `in_codex` or `home`
+10. live Codex sessions relaunch and resume their tracked thread where possible
 11. broker -> `active` if any sessions are in Codex, else `home_ready`
+
+### Flow 4a: Forced switch while another session is busy
+
+1. broker `switching_profile`
+2. initiating Home session chooses force
+3. broker commits the switch immediately
+4. shared server restarts
+5. live Codex sessions are reloaded even if that interrupts active work
+6. broker -> `reloading_sessions`
 
 ### Flow 5: Resume failure
 
@@ -298,6 +307,14 @@ Must update:
 - `broker.json.active_auth_epoch_id`
 - `broker.json.switch_context`
 - `sessions.json.sessions[*].last_seen_auth_epoch_id` after successful reload
+
+### On pending profile switch
+
+Must update:
+
+- `broker.json.switch_context`
+- `broker.json.broker_state`
+- Home snapshot fields describing the pending switch
 
 ### On return from Codex
 
@@ -359,3 +376,4 @@ The implementation should preserve these invariants:
 3. Each visible wrapper session has at most one active Codex thread id.
 4. A profile switch increments auth epoch exactly once.
 5. `F12` never silently discards a known active thread id if it can be captured.
+6. While a switch is pending, `selected_profile_id` still refers to the currently active account, not the requested target.

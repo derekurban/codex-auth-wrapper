@@ -136,11 +136,13 @@ type ServerInfo struct {
 }
 
 type SwitchContext struct {
-	InProgress           bool       `json:"in_progress"`
-	FromProfileID        *string    `json:"from_profile_id"`
-	ToProfileID          *string    `json:"to_profile_id"`
-	InitiatedBySessionID *string    `json:"initiated_by_session_id"`
-	InitiatedAt          *time.Time `json:"initiated_at"`
+	InProgress               bool       `json:"in_progress"`
+	FromProfileID            *string    `json:"from_profile_id"`
+	ToProfileID              *string    `json:"to_profile_id"`
+	InitiatedBySessionID     *string    `json:"initiated_by_session_id"`
+	InitiatedAt              *time.Time `json:"initiated_at"`
+	BlockingBusySessionCount int        `json:"blocking_busy_session_count"`
+	LastUpdatedAt            *time.Time `json:"last_updated_at"`
 }
 
 type ProfileFile struct {

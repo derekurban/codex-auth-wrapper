@@ -36,6 +36,13 @@ type trackedThread struct {
 	Cwd string
 }
 
+type gatewayObservation struct {
+	Thread       *trackedThread
+	TurnStarted  bool
+	TurnComplete bool
+	ThreadStatus string
+}
+
 func (s *Service) startGateway(ctx context.Context) error {
 	s.mu.Lock()
 	if s.gateway != nil {
@@ -125,6 +132,14 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 
 	state := &gatewayConnState{pending: map[string]pendingThreadRequest{}}
 	errCh := make(chan error, 2)
+	if err := s.setGatewayConnected(context.Background(), sessionID, true); err != nil {
+		s.setDegraded(err)
+	}
+	defer func() {
+		if err := s.setGatewayConnected(context.Background(), sessionID, false); err != nil {
+			s.setDegraded(err)
+		}
+	}()
 
 	go func() {
 		errCh <- proxyFrames(clientConn, backendConn, func(data []byte) []byte {
@@ -135,8 +150,27 @@ func (s *Service) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request)
 	}()
 	go func() {
 		errCh <- proxyFrames(backendConn, clientConn, nil, func(data []byte) {
-			if thread, ok := state.trackServerMessage(data); ok {
-				if err := s.updateSessionActiveThread(sessionID, thread); err != nil {
+			// Gateway notifications are the broker's live truth for whether a
+			// Codex session is busy. We cannot infer safe global auth switching
+			// from terminal output or persisted rollout files reliably.
+			observation := state.trackServerMessage(data)
+			if observation.Thread != nil {
+				if err := s.updateSessionActiveThread(sessionID, *observation.Thread); err != nil {
+					s.setDegraded(err)
+				}
+			}
+			if observation.TurnStarted {
+				if err := s.noteTurnStarted(context.Background(), sessionID); err != nil {
+					s.setDegraded(err)
+				}
+			}
+			if observation.TurnComplete {
+				if err := s.noteTurnCompleted(context.Background(), sessionID); err != nil {
+					s.setDegraded(err)
+				}
+			}
+			if observation.ThreadStatus != "" {
+				if err := s.noteThreadStatus(context.Background(), sessionID, observation.ThreadStatus); err != nil {
 					s.setDegraded(err)
 				}
 			}
@@ -300,11 +334,24 @@ func (s *gatewayConnState) trackClientMessage(data []byte) {
 	s.mu.Unlock()
 }
 
-func (s *gatewayConnState) trackServerMessage(data []byte) (trackedThread, bool) {
+func (s *gatewayConnState) trackServerMessage(data []byte) gatewayObservation {
+	observation := gatewayObservation{}
 	if thread, ok := trackThreadStartedNotification(data); ok {
-		return thread, true
+		observation.Thread = &thread
 	}
-	return s.trackResponse(data)
+	if thread, ok := s.trackResponse(data); ok {
+		observation.Thread = &thread
+	}
+	if trackTurnStartedNotification(data) {
+		observation.TurnStarted = true
+	}
+	if trackTurnCompletedNotification(data) {
+		observation.TurnComplete = true
+	}
+	if status, ok := trackThreadStatusChangedNotification(data); ok {
+		observation.ThreadStatus = status
+	}
+	return observation
 }
 
 func (s *gatewayConnState) trackResponse(data []byte) (trackedThread, bool) {
@@ -361,6 +408,9 @@ func trackThreadStartedNotification(data []byte) (trackedThread, bool) {
 				ID  string `json:"id"`
 				Cwd string `json:"cwd"`
 			} `json:"thread"`
+			Status struct {
+				Type string `json:"type"`
+			} `json:"status"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -370,6 +420,38 @@ func trackThreadStartedNotification(data []byte) (trackedThread, bool) {
 		return trackedThread{}, false
 	}
 	return trackedThread{ID: msg.Params.Thread.ID, Cwd: msg.Params.Thread.Cwd}, true
+}
+
+func trackTurnStartedNotification(data []byte) bool {
+	var msg struct {
+		Method string `json:"method"`
+	}
+	return json.Unmarshal(data, &msg) == nil && msg.Method == "turn/started"
+}
+
+func trackTurnCompletedNotification(data []byte) bool {
+	var msg struct {
+		Method string `json:"method"`
+	}
+	return json.Unmarshal(data, &msg) == nil && msg.Method == "turn/completed"
+}
+
+func trackThreadStatusChangedNotification(data []byte) (string, bool) {
+	var msg struct {
+		Method string `json:"method"`
+		Params struct {
+			Status struct {
+				Type string `json:"type"`
+			} `json:"status"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return "", false
+	}
+	if msg.Method != "thread/status/changed" || msg.Params.Status.Type == "" {
+		return "", false
+	}
+	return msg.Params.Status.Type, true
 }
 
 func responseIDKey(raw json.RawMessage) string {

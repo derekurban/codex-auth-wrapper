@@ -39,6 +39,7 @@ type Action struct {
 
 type ExternalEvent struct {
 	Reload *ipc.ReloadNotice
+	Switch *ipc.SwitchNotice
 }
 
 type screen string
@@ -72,6 +73,12 @@ type Model struct {
 
 type snapshotMsg struct {
 	snapshot ipc.HomeSnapshotResponse
+	err      error
+}
+
+type snapshotStatusMsg struct {
+	snapshot ipc.HomeSnapshotResponse
+	status   string
 	err      error
 }
 
@@ -130,9 +137,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case externalPollTickMsg:
 		cmds := []tea.Cmd{m.externalPollCmd()}
 		if m.pollExternal != nil {
-			if event := m.pollExternal(); event != nil && event.Reload != nil {
-				m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile. Any active Codex session will pick up the new account after it returns here."
-				cmds = append(cmds, m.refreshCmd(false))
+			if event := m.pollExternal(); event != nil {
+				switch {
+				case event.Switch != nil:
+					m.statusMessage = event.Switch.Message
+					cmds = append(cmds, m.refreshCmd(false))
+				case event.Reload != nil:
+					m.statusMessage = event.Reload.Message
+					cmds = append(cmds, m.refreshCmd(false))
+				}
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -146,6 +159,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.isLoading = false
 		m.hasSnapshot = true
 		m.snapshot = msg.snapshot
+		m.syncSelection()
+		return m, nil
+	case snapshotStatusMsg:
+		if msg.err != nil {
+			m.errMessage = msg.err.Error()
+			m.isLoading = false
+			return m, nil
+		}
+		m.errMessage = ""
+		m.isLoading = false
+		m.hasSnapshot = true
+		m.snapshot = msg.snapshot
+		m.statusMessage = msg.status
 		m.syncSelection()
 		return m, nil
 	case settingsUpdatedMsg:
@@ -225,20 +251,53 @@ func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.snapshot.Profiles) == 0 {
 			return m, nil
 		}
+		if m.snapshot.PendingSwitch != nil && !m.snapshot.PendingSwitch.InitiatedByCurrentSession {
+			m.statusMessage = "Another CAW window is already managing a pending account switch."
+			return m, nil
+		}
 		profile := m.snapshot.Profiles[m.selectedIndex]
-		if profile.Selected {
+		if profile.Selected && !profile.PendingTarget {
 			return m, nil
 		}
 		return m, func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
+			var resp ipc.SelectProfileResponse
 			if err := m.client.Request(ctx, "profile.select", ipc.SelectProfileRequest{
 				SessionID: m.sessionID,
 				ProfileID: profile.ID,
-			}, nil); err != nil {
-				return snapshotMsg{err: err}
+			}, &resp); err != nil {
+				return snapshotStatusMsg{err: err}
 			}
-			return loadSnapshot(m.client, m.sessionID, true)
+			return loadSnapshotWithStatus(m.client, m.sessionID, true, profileSelectStatus(resp, profile.Name))
+		}
+	case "f":
+		if m.snapshot.PendingSwitch == nil || !m.snapshot.PendingSwitch.CanForce {
+			return m, nil
+		}
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := m.client.Request(ctx, "profile.switch.force", ipc.ForcePendingSwitchRequest{
+				SessionID: m.sessionID,
+			}, nil); err != nil {
+				return snapshotStatusMsg{err: err}
+			}
+			return loadSnapshotWithStatus(m.client, m.sessionID, true, "Forced account switch. Live Codex sessions are reloading.")
+		}
+	case "c":
+		if m.snapshot.PendingSwitch == nil || !m.snapshot.PendingSwitch.CanCancel {
+			return m, nil
+		}
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := m.client.Request(ctx, "profile.switch.cancel", ipc.CancelPendingSwitchRequest{
+				SessionID: m.sessionID,
+			}, nil); err != nil {
+				return snapshotStatusMsg{err: err}
+			}
+			return loadSnapshotWithStatus(m.client, m.sessionID, true, "Pending account switch cancelled.")
 		}
 	case "enter":
 		if len(m.snapshot.Profiles) == 0 {
@@ -249,6 +308,10 @@ func (m Model) updateHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.idInput.SetValue("")
 			m.nameInput.Focus()
 			m.idInput.Blur()
+			return m, nil
+		}
+		if m.snapshot.PendingSwitch != nil {
+			m.statusMessage = "Account switch is pending. Wait for live Codex sessions to become idle, or force/cancel the switch first."
 			return m, nil
 		}
 		m.action = Action{Type: ActionContinue}
@@ -370,6 +433,9 @@ func (m Model) viewHome(bodyHeight int) string {
 			primary = "Press Enter to resume your active Codex thread"
 		}
 	}
+	if m.snapshot.PendingSwitch != nil {
+		primary = "Account switch pending until live Codex sessions become idle"
+	}
 
 	headerLines := []string{
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7BD389")).Render(primary),
@@ -378,7 +444,7 @@ func (m Model) viewHome(bodyHeight int) string {
 	if sessionLine := m.renderSessionLine(); sessionLine != "" {
 		headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(sessionLine))
 	}
-	headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Keys: Enter continue  a add account  s settings  space select account  r refresh all  q quit"))
+	headerLines = append(headerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(m.renderKeyLine()))
 
 	headerPanel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -418,6 +484,9 @@ func (m Model) renderStatusLine() string {
 	if m.errMessage != "" {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Render(m.errMessage)
 	}
+	if m.snapshot.PendingSwitch != nil {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#F6AE2D")).Render(renderPendingSwitchLine(*m.snapshot.PendingSwitch))
+	}
 	if strings.TrimSpace(m.statusMessage) != "" {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render(m.statusMessage)
 	}
@@ -432,6 +501,23 @@ func (m Model) renderStatusLine() string {
 		clearMode = "off"
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("#9DB4C0")).Render("Home refreshes profile data automatically, `r` forces a fresh pass, and launch screen clearing is " + clearMode + ".")
+}
+
+func (m Model) renderKeyLine() string {
+	if m.snapshot.PendingSwitch != nil {
+		keys := "Keys: a add account  s settings  r refresh all  q quit"
+		if m.snapshot.PendingSwitch.InitiatedByCurrentSession {
+			keys = "Keys: a add account  s settings  space retarget pending switch  r refresh all  q quit"
+		}
+		if m.snapshot.PendingSwitch.CanForce {
+			keys += "  f force switch"
+		}
+		if m.snapshot.PendingSwitch.CanCancel {
+			keys += "  c cancel switch"
+		}
+		return keys
+	}
+	return "Keys: Enter continue  a add account  s settings  space select account  r refresh all  q quit"
 }
 
 func (m Model) renderSessionLine() string {
@@ -496,6 +582,9 @@ func (m Model) renderProfileRow(index int, width int, rowHeight int) string {
 	if profile.Selected {
 		title += " [selected]"
 	}
+	if profile.PendingTarget {
+		title += " [pending]"
+	}
 	line1Parts := []string{
 		cursor + " " + title,
 		strings.ToUpper(string(profile.Health)),
@@ -555,6 +644,9 @@ func (m Model) visibleProfileRows() int {
 func (m Model) homeHeaderHeightEstimate() int {
 	height := 8
 	if m.snapshot.Session != nil && m.snapshot.Session.ActiveThreadID != nil && *m.snapshot.Session.ActiveThreadID != "" {
+		height += 2
+	}
+	if m.snapshot.PendingSwitch != nil {
 		height += 2
 	}
 	return height
@@ -791,6 +883,34 @@ func compactPathLabel(path string) string {
 	return base
 }
 
+func renderPendingSwitchLine(pending ipc.PendingSwitch) string {
+	target := pending.ToProfileName
+	if target == "" && pending.ToProfileID != nil {
+		target = *pending.ToProfileID
+	}
+	switch pending.BlockingBusySessionCount {
+	case 0:
+		return "Account switch is pending and will commit on the next broker check."
+	case 1:
+		return fmt.Sprintf("Waiting for 1 active Codex session to become idle before switching to %s.", target)
+	default:
+		return fmt.Sprintf("Waiting for %d active Codex sessions to become idle before switching to %s.", pending.BlockingBusySessionCount, target)
+	}
+}
+
+func profileSelectStatus(resp ipc.SelectProfileResponse, profileName string) string {
+	switch resp.Outcome {
+	case ipc.ProfileSelectOutcomeSwitched:
+		return fmt.Sprintf("Switched to %s.", profileName)
+	case ipc.ProfileSelectOutcomePending:
+		return fmt.Sprintf("Pending switch to %s created. CAW will wait for live Codex sessions to become idle.", profileName)
+	case ipc.ProfileSelectOutcomeUpdatedPending:
+		return fmt.Sprintf("Pending switch retargeted to %s.", profileName)
+	default:
+		return ""
+	}
+}
+
 func (m Model) refreshCmd(force bool) tea.Cmd {
 	return func() tea.Msg {
 		return loadSnapshot(m.client, m.sessionID, force)
@@ -828,6 +948,21 @@ func loadSnapshot(client *ipc.Client, sessionID string, force bool) snapshotMsg 
 		ForceRefresh: force,
 	}, &snapshot)
 	return snapshotMsg{snapshot: snapshot, err: err}
+}
+
+func loadSnapshotWithStatus(client *ipc.Client, sessionID string, force bool, status string) snapshotStatusMsg {
+	timeout := 5 * time.Second
+	if force {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var snapshot ipc.HomeSnapshotResponse
+	err := client.Request(ctx, "home.snapshot", ipc.HomeSnapshotRequest{
+		SessionID:    sessionID,
+		ForceRefresh: force,
+	}, &snapshot)
+	return snapshotStatusMsg{snapshot: snapshot, status: status, err: err}
 }
 
 func (m Model) externalPollCmd() tea.Cmd {

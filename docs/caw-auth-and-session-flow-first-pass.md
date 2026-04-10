@@ -26,7 +26,7 @@ The currently selected account profile whose auth material is loaded into the sh
 
 ### Shared runtime
 
-The broker-owned Codex home and server context currently used by linked wrapper sessions.
+The stock Codex home and shared `codex app-server` context currently used by linked wrapper sessions.
 
 ### Visible wrapper session
 
@@ -182,10 +182,24 @@ The user returns to the home page and selects a different account profile.
 
 The wrapper must explain that auth switching is global for all linked wrapper sessions using that shared runtime.
 
+### Required pending-switch rule
+
+If another linked wrapper session is still actively running a Codex turn, the wrapper must not switch immediately.
+
+Instead it must:
+
+1. keep the current active account selected
+2. mark the requested account as the pending target
+3. show a Home-state banner explaining that the switch is waiting for all live Codex sessions to become idle
+4. disable `Enter` from Home while the pending switch exists
+5. expose `force switch now` and `cancel pending switch` controls to the initiating Home session
+
 ### Required switch sequence
 
+Once all live Codex sessions are idle, or once the user forces the switch, the wrapper must:
+
 1. persist the current active auth context back to its managed account profile
-2. mark the selected account profile as active
+2. mark the target account profile as active
 3. materialize that account’s auth into the shared Codex home
 4. restart the shared server
 5. invalidate and reload all linked wrapper sessions attached to the old auth context
@@ -193,16 +207,32 @@ The wrapper must explain that auth switching is global for all linked wrapper se
 
 ## What Other Sessions Should Experience
 
-If one wrapper instance switches auth context, all linked wrapper instances must reload.
+If one wrapper instance requests an auth switch, all linked wrapper instances must converge on that switch.
 
-Expected user-visible notice:
+Expected user-visible behavior:
 
 ```text
-Codex Auth Wrapper is switching auth contexts.
-This session will be reloaded and resumed.
+Waiting for active Codex sessions to become idle before switching accounts.
+```
+
+Then, once the switch commits:
+
+```text
+Account switched.
+Live Codex sessions are reloading onto the new account.
 ```
 
 After reload, each session should return to its own latest thread id where possible.
+
+### Busy vs idle rule
+
+For pending-switch decisions:
+
+- a Home window is not blocking
+- an idle Codex window is not blocking
+- a Codex window with an in-flight turn is blocking
+
+The broker should use live app-server notifications, not terminal output parsing, to determine this.
 
 ## Continue After Switching
 

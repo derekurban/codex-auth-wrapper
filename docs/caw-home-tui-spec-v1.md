@@ -307,13 +307,28 @@ The confirmation must state:
 
 On confirm, the wrapper must:
 
-1. record current per-session active thread ids
-2. persist current runtime auth back to the currently selected profile
-3. copy target profile auth into the shared Codex runtime
-4. restart the shared server
-5. mark target profile as selected
-6. flag all linked sessions for reload/resume
-7. return to Home
+1. inspect all live wrapper sessions
+2. if any live Codex session is actively running a turn, enter pending-switch state instead of switching immediately
+3. if no live Codex session is busy, persist current runtime auth back to the currently selected profile
+4. copy target profile auth into the shared Codex runtime
+5. restart the shared server
+6. mark target profile as selected
+7. flag all linked sessions for reload/resume
+8. return to Home
+
+### Pending-switch Home behavior
+
+While a global account switch is pending, Home must:
+
+- keep the current active account visibly selected
+- mark the requested target account as pending
+- show a banner explaining how many active Codex sessions are still blocking the switch
+- disable `Enter`
+- let only the initiating Home session choose:
+  - `force switch now`
+  - `cancel pending switch`
+
+Other Home sessions may observe the pending switch, but may not take ownership of it.
 
 ## Screen 7: Near-Limit Warning
 
@@ -432,7 +447,9 @@ All linked wrapper sessions under the same shared runtime must share:
 When auth context changes:
 
 - all linked sessions must be invalidated
-- all linked sessions must be reloaded
+- Home sessions must refresh immediately
+- idle live Codex sessions must be reloaded automatically
+- busy live Codex sessions should delay the switch until they become idle unless the user forces the switch
 - each session must preserve its own active Codex thread id for resume
 
 ## v1 Non-Goals For The Home TUI
