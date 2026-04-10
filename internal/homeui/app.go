@@ -18,6 +18,7 @@ const (
 	defaultRefreshInterval = 45 * time.Second
 	warningRefreshInterval = 15 * time.Second
 	backgroundRefreshTick  = 2 * time.Second
+	externalPollInterval   = 1 * time.Second
 	pageHorizontalPadding  = 3
 	pageVerticalPadding    = 1
 )
@@ -50,7 +51,7 @@ const (
 
 type Model struct {
 	client        *ipc.Client
-	events        <-chan ExternalEvent
+	pollExternal  func() *ExternalEvent
 	sessionID     string
 	screen        screen
 	width         int
@@ -80,9 +81,9 @@ type settingsUpdatedMsg struct {
 }
 
 type refreshTickMsg time.Time
-type externalEventMsg ExternalEvent
+type externalPollTickMsg time.Time
 
-func Run(client *ipc.Client, events <-chan ExternalEvent, sessionID string, statusMessage string) (Action, error) {
+func Run(client *ipc.Client, pollExternal func() *ExternalEvent, sessionID string, statusMessage string) (Action, error) {
 	nameInput := textinput.New()
 	nameInput.Placeholder = "Personal 1"
 	nameInput.CharLimit = 48
@@ -94,7 +95,7 @@ func Run(client *ipc.Client, events <-chan ExternalEvent, sessionID string, stat
 
 	model := Model{
 		client:        client,
-		events:        events,
+		pollExternal:  pollExternal,
 		sessionID:     sessionID,
 		screen:        screenHome,
 		isLoading:     true,
@@ -112,7 +113,7 @@ func Run(client *ipc.Client, events <-chan ExternalEvent, sessionID string, stat
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refreshCmd(false), m.refreshTickCmd(), m.waitForExternalEvent())
+	return tea.Batch(m.refreshCmd(false), m.refreshTickCmd(), m.externalPollCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -126,6 +127,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.refreshTickCmd()
 		}
 		return m, tea.Batch(m.refreshCmd(false), m.refreshTickCmd())
+	case externalPollTickMsg:
+		cmds := []tea.Cmd{m.externalPollCmd()}
+		if m.pollExternal != nil {
+			if event := m.pollExternal(); event != nil && event.Reload != nil {
+				m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile. Any active Codex session will pick up the new account after it returns here."
+				cmds = append(cmds, m.refreshCmd(false))
+			}
+		}
+		return m, tea.Batch(cmds...)
 	case snapshotMsg:
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
@@ -138,13 +148,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshot = msg.snapshot
 		m.syncSelection()
 		return m, nil
-	case externalEventMsg:
-		cmds := []tea.Cmd{m.waitForExternalEvent()}
-		if msg.Reload != nil {
-			m.statusMessage = "Account switched in another CAW window. Home reloaded to the active profile. Any active Codex session will pick up the new account after it returns here."
-			cmds = append(cmds, m.refreshCmd(false))
-		}
-		return m, tea.Batch(cmds...)
 	case settingsUpdatedMsg:
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
@@ -827,17 +830,10 @@ func loadSnapshot(client *ipc.Client, sessionID string, force bool) snapshotMsg 
 	return snapshotMsg{snapshot: snapshot, err: err}
 }
 
-func (m Model) waitForExternalEvent() tea.Cmd {
-	if m.events == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		event, ok := <-m.events
-		if !ok {
-			return nil
-		}
-		return externalEventMsg(event)
-	}
+func (m Model) externalPollCmd() tea.Cmd {
+	return tea.Tick(externalPollInterval, func(t time.Time) tea.Msg {
+		return externalPollTickMsg(t)
+	})
 }
 
 func max(a, b int) int {

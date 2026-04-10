@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +26,29 @@ var (
 	commit  = "none"
 	date    = "unknown"
 )
+
+type hostSignals struct {
+	mu     sync.Mutex
+	reload *ipc.ReloadNotice
+}
+
+func (s *hostSignals) setReload(notice ipc.ReloadNotice) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := notice
+	s.reload = &copy
+}
+
+func (s *hostSignals) takeReload() *homeui.ExternalEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reload == nil {
+		return nil
+	}
+	event := &homeui.ExternalEvent{Reload: s.reload}
+	s.reload = nil
+	return event
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -118,7 +142,7 @@ func unregisterSession(client *ipc.Client, sessionID string) {
 }
 
 func runHost(paths store.Paths) error {
-	events := make(chan homeui.ExternalEvent, 32)
+	signals := &hostSignals{}
 	client, err := ensureClient(paths, func(name string, payload json.RawMessage) {
 		if name != "reload.notice" {
 			return
@@ -127,10 +151,7 @@ func runHost(paths store.Paths) error {
 		if err := json.Unmarshal(payload, &notice); err != nil {
 			return
 		}
-		select {
-		case events <- homeui.ExternalEvent{Reload: &notice}:
-		default:
-		}
+		signals.setReload(notice)
 	})
 	if err != nil {
 		return err
@@ -154,7 +175,7 @@ func runHost(paths store.Paths) error {
 
 	statusMessage := ""
 	for {
-		action, err := homeui.Run(client, events, sessionID, statusMessage)
+		action, err := homeui.Run(client, signals.takeReload, sessionID, statusMessage)
 		if err != nil {
 			return err
 		}
@@ -169,7 +190,7 @@ func runHost(paths store.Paths) error {
 				statusMessage = message
 			}
 		case homeui.ActionContinue:
-			message, err := launchCodexFlow(client, paths, events, sessionID, cwd)
+			message, err := launchCodexFlow(client, paths, signals, sessionID, cwd)
 			if err != nil {
 				statusMessage = "Codex launch failed: " + err.Error()
 			} else {
@@ -210,7 +231,7 @@ func addProfileFlow(client *ipc.Client, action homeui.Action) (string, error) {
 	return fmt.Sprintf("Linked account %q.", action.ProfileName), nil
 }
 
-func launchCodexFlow(client *ipc.Client, paths store.Paths, events <-chan homeui.ExternalEvent, sessionID string, cwd string) (string, error) {
+func launchCodexFlow(client *ipc.Client, paths store.Paths, signals *hostSignals, sessionID string, cwd string) (string, error) {
 	pendingReload := false
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -264,11 +285,11 @@ func launchCodexFlow(client *ipc.Client, paths store.Paths, events <-chan homeui
 					return "", err
 				}
 				return returnHomeMessage(spec, pendingReload), nil
-			case event := <-events:
-				if event.Reload == nil || !isNewerAuthEpoch(event.Reload.AuthEpochID, spec.AuthEpochID) {
-					continue
+			default:
+				if event := signals.takeReload(); event != nil && event.Reload != nil && isNewerAuthEpoch(event.Reload.AuthEpochID, spec.AuthEpochID) {
+					pendingReload = true
 				}
-				pendingReload = true
+				time.Sleep(150 * time.Millisecond)
 			}
 		}
 	}
