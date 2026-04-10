@@ -314,7 +314,8 @@ launchLoop:
 		for {
 			select {
 			case err := <-waitCh:
-				if reloadNotice != nil && isNewerAuthEpoch(reloadNotice.AuthEpochID, spec.AuthEpochID) {
+				if nextReload, reload := reloadAfterExit(client, spec, reloadNotice); reload {
+					reloadNotice = nextReload
 					continue launchLoop
 				}
 				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -335,17 +336,32 @@ launchLoop:
 						SessionID: sessionID,
 						State:     model.SessionStateReloading,
 					}, nil)
-					// Auth changes are connection-bound in stock Codex, so a
-					// committed global switch is applied by restarting the live
-					// Codex child and resuming the tracked thread on the new epoch.
-					if cmd.Process != nil {
-						_ = cmd.Process.Kill()
-					}
 				}
 				time.Sleep(150 * time.Millisecond)
 			}
 		}
 	}
+}
+
+func reloadAfterExit(client *ipc.Client, spec ipc.LaunchSpec, current *ipc.ReloadNotice) (*ipc.ReloadNotice, bool) {
+	if current != nil && isNewerAuthEpoch(current.AuthEpochID, spec.AuthEpochID) {
+		return current, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var snapshot ipc.StatusSnapshot
+	if err := client.Request(ctx, "status.snapshot", ipc.Empty{}, &snapshot); err != nil {
+		return nil, false
+	}
+	if isNewerAuthEpoch(snapshot.ActiveAuthEpochID, spec.AuthEpochID) {
+		return &ipc.ReloadNotice{
+			AuthEpochID: snapshot.ActiveAuthEpochID,
+			ProfileID:   snapshot.ActiveProfileID,
+			Reason:      "profile_switched",
+			Message:     "Account switched. Reloading this Codex session onto the new account.",
+		}, true
+	}
+	return nil, false
 }
 
 func returnHomeMessage(spec ipc.LaunchSpec, pendingReload bool) string {

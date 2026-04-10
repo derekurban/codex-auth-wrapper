@@ -38,6 +38,7 @@ type Service struct {
 	store *store.Store
 
 	mu             sync.Mutex
+	switchMu       sync.Mutex
 	refreshRunMu   sync.Mutex
 	server         *ipc.Server
 	gateway        *gatewayServer
@@ -108,6 +109,8 @@ func (s *Service) reconcileStartup(ctx context.Context) error {
 		return s.store.SaveBroker(brokerState)
 	}
 	if brokerState.SwitchContext.InProgress && brokerState.SwitchContext.ToProfileID != nil {
+		s.switchMu.Lock()
+		defer s.switchMu.Unlock()
 		return s.commitProfileSwitch(ctx, *brokerState.SwitchContext.ToProfileID, false, "startup_pending_switch")
 	}
 	return s.activateProfile(ctx, *state.SelectedProfileID, "startup")

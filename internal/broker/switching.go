@@ -11,6 +11,8 @@ import (
 
 func (s *Service) selectProfile(ctx context.Context, connID string, req ipc.SelectProfileRequest) (ipc.SelectProfileResponse, error) {
 	_ = connID
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
 	state, err := s.store.LoadState()
 	if err != nil {
 		return ipc.SelectProfileResponse{}, err
@@ -62,6 +64,8 @@ func (s *Service) selectProfile(ctx context.Context, connID string, req ipc.Sele
 }
 
 func (s *Service) forcePendingSwitch(ctx context.Context, req ipc.ForcePendingSwitchRequest) (ipc.PendingSwitchResponse, error) {
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
 	brokerState, err := s.store.LoadBroker()
 	if err != nil {
 		return ipc.PendingSwitchResponse{}, err
@@ -79,6 +83,8 @@ func (s *Service) forcePendingSwitch(ctx context.Context, req ipc.ForcePendingSw
 }
 
 func (s *Service) cancelPendingSwitch(req ipc.CancelPendingSwitchRequest) (ipc.PendingSwitchResponse, error) {
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
 	brokerState, err := s.store.LoadBroker()
 	if err != nil {
 		return ipc.PendingSwitchResponse{}, err
@@ -100,6 +106,8 @@ func (s *Service) cancelPendingSwitch(req ipc.CancelPendingSwitchRequest) (ipc.P
 }
 
 func (s *Service) reconcilePendingSwitch(ctx context.Context, reason string) error {
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
 	brokerState, err := s.store.LoadBroker()
 	if err != nil {
 		return err
@@ -202,6 +210,7 @@ func (s *Service) commitProfileSwitch(ctx context.Context, profileID string, for
 	}
 
 	brokerState.BrokerState = model.BrokerStateReloading
+	brokerState.SwitchContext = model.SwitchContext{}
 	brokerState.UpdatedAt = now
 	if err := s.store.SaveBroker(brokerState); err != nil {
 		return err
