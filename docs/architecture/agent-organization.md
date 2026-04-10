@@ -29,6 +29,9 @@ which behavior.
   - Visible terminal session runtime.
   - Owns one CAW window's Codex child lifecycle, reload handling, and
     return-to-Home behavior.
+  - `internal/host/conpty` is the Windows terminal-boundary mechanism package.
+    It owns pseudoconsole process hosting and raw input/output forwarding, but
+    it must not own broker policy or Home workflow decisions.
 
 - `internal/homeui`
   - Presentation only.

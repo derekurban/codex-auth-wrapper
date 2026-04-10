@@ -3,14 +3,14 @@ package host
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/derekurban/codex-auth-wrapper/internal/codex"
 	"github.com/derekurban/codex-auth-wrapper/internal/homeui"
+	"github.com/derekurban/codex-auth-wrapper/internal/host/conpty"
 	"github.com/derekurban/codex-auth-wrapper/internal/ipc"
 	"github.com/derekurban/codex-auth-wrapper/internal/model"
 	"github.com/derekurban/codex-auth-wrapper/internal/store"
@@ -148,25 +148,36 @@ launchLoop:
 		fmt.Println("Exit Codex normally to return to the wrapper home. F12 interception is not wired yet in this build.")
 		fmt.Println()
 
-		cmd, err := codex.StartRemote(spec, r.paths.CodexHome)
+		// The host owns a ConPTY boundary so CAW can manage reloads and stale
+		// child recovery without giving the real console directly to stock Codex.
+		var interruptedByUser atomic.Bool
+		var session *conpty.Session
+		session, err = conpty.Start(codex.BuildRemoteCommand(spec, r.paths.CodexHome), func() {
+			interruptedByUser.Store(true)
+			_ = sessionKillSafe(session)
+		})
 		if err != nil {
 			return "", err
 		}
-		if cmd.Process != nil {
-			pid := cmd.Process.Pid
+		if pid := session.PID(); pid > 0 {
 			_ = r.client.Request(context.Background(), "session.update_state", ipc.UpdateSessionStateRequest{
 				SessionID:     r.session,
 				State:         model.SessionStateInCodex,
 				CodexChildPID: &pid,
 			}, nil)
 		}
-		waitCh := make(chan error, 1)
+		type waitResult struct {
+			exitCode int
+			err      error
+		}
+		waitCh := make(chan waitResult, 1)
 		go func() {
-			waitCh <- cmd.Wait()
+			exitCode, waitErr := session.Wait()
+			waitCh <- waitResult{exitCode: exitCode, err: waitErr}
 		}()
 		for {
 			select {
-			case err := <-waitCh:
+			case result := <-waitCh:
 				if nextReload, reload := r.reloadAfterExit(spec, reloadNotice); reload {
 					reloadNotice = nextReload
 					continue launchLoop
@@ -174,12 +185,11 @@ launchLoop:
 				homeCtx, homeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_ = r.client.Request(homeCtx, "session.return_home", ipc.ReturnHomeRequest{SessionID: r.session}, nil)
 				homeCancel()
-				if err != nil {
-					var exitErr *exec.ExitError
-					if errors.As(err, &exitErr) {
-						return returnHomeMessage(spec), nil
-					}
-					return "", err
+				if interruptedByUser.Load() {
+					return returnHomeMessage(spec), nil
+				}
+				if result.err != nil {
+					return "", result.err
 				}
 				return returnHomeMessage(spec), nil
 			default:
@@ -197,15 +207,20 @@ launchLoop:
 					// has already been restarted underneath them. Without a bounded
 					// fallback, the visible CAW terminal can sit forever on stale
 					// "Working" output even though the thread has already completed.
-					if cmd.Process != nil {
-						_ = cmd.Process.Kill()
-					}
+					_ = session.Kill()
 					reloadKillIssued = true
 				}
 				time.Sleep(150 * time.Millisecond)
 			}
 		}
 	}
+}
+
+func sessionKillSafe(session *conpty.Session) error {
+	if session == nil {
+		return nil
+	}
+	return session.Kill()
 }
 
 func (r *SessionRuntime) reloadAfterExit(spec ipc.LaunchSpec, current *ipc.ReloadNotice) (*ipc.ReloadNotice, bool) {

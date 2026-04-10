@@ -13,6 +13,16 @@ import (
 
 const RemoteAuthTokenEnv = "CAW_REMOTE_AUTH_TOKEN"
 
+// CommandSpec is the neutral process-launch contract for a stock Codex child.
+// Host runtimes choose the concrete execution mechanism, such as direct exec or
+// a ConPTY-owned terminal boundary.
+type CommandSpec struct {
+	Path string
+	Args []string
+	Env  []string
+	Dir  string
+}
+
 func Slugify(input string) string {
 	trimmed := strings.TrimSpace(strings.ToLower(input))
 	if trimmed == "" {
@@ -51,6 +61,20 @@ func LaunchRemote(spec ipc.LaunchSpec, codexHome string) error {
 }
 
 func StartRemote(spec ipc.LaunchSpec, codexHome string) (*exec.Cmd, error) {
+	command := BuildRemoteCommand(spec, codexHome)
+	cmd := exec.Command(command.Path, command.Args...)
+	cmd.Env = command.Env
+	cmd.Dir = command.Dir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func BuildRemoteCommand(spec ipc.LaunchSpec, codexHome string) CommandSpec {
 	args := []string{}
 	if spec.Mode == ipc.LaunchModeResume && spec.ThreadID != nil && *spec.ThreadID != "" {
 		args = append(args, "resume", *spec.ThreadID)
@@ -62,19 +86,16 @@ func StartRemote(spec ipc.LaunchSpec, codexHome string) (*exec.Cmd, error) {
 		"--remote", spec.GatewayURL,
 		"--remote-auth-token-env", spec.TokenEnvName,
 	)
-	cmd := exec.Command("codex", args...)
-	cmd.Env = append(os.Environ(),
-		"CODEX_HOME="+codexHome,
-		fmt.Sprintf("%s=%s", spec.TokenEnvName, spec.Token),
-	)
+	command := CommandSpec{
+		Path: "codex",
+		Args: args,
+		Env: append(os.Environ(),
+			"CODEX_HOME="+codexHome,
+			fmt.Sprintf("%s=%s", spec.TokenEnvName, spec.Token),
+		),
+	}
 	if spec.SelectedCwd != "" {
-		cmd.Dir = spec.SelectedCwd
+		command.Dir = spec.SelectedCwd
 	}
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return cmd, nil
+	return command
 }

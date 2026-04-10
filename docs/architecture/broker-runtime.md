@@ -38,6 +38,12 @@ profile vault in `~/.codex-auth-wrapper`.
 
 - `HostSessionRuntime`
   - Owns one CAW terminal's Codex child process and reload/relaunch policy.
+  - Owns the ConPTY-backed terminal boundary for live Codex sessions so CAW
+    can manage input, resize propagation, reloads, and stale-child recovery
+    without giving the real console directly to stock Codex.
+  - While Codex is live, `Ctrl+C` is CAW-owned input. It returns that window to
+    Home instead of forwarding the interrupt into stock Codex. On Home, the
+    existing TUI `Ctrl+C` behavior still exits the wrapper.
   - Applies a bounded wait during reload; if a stale Codex child does not exit
     after the shared app-server has already moved on, CAW terminates that stale
     child and continues the relaunch path.
